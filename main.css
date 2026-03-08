@@ -1,0 +1,305 @@
+:root {
+  --bg-a: #f7fafc;
+  --bg-b: #e8edf4;
+  --surface: #ffffff;
+  --surface-soft: #f4f7fb;
+  --surface-strong: #e8eef5;
+  --border: #ccd5e2;
+  --border-strong: #b6c2d2;
+  --text-main: #1f2a37;
+  --text-soft: #4b5b6f;
+  --brand: #2878d9;
+  --brand-strong: #1c62b7;
+  --ring: rgba(40, 120, 217, 0.25);
+  --accent-fill: rgba(160, 80, 255, 0.32);
+  --accent-stroke: rgba(139, 61, 233, 0.94);
+  --shadow-sm: 0 2px 8px rgba(18, 33, 53, 0.08);
+  --shadow-md: 0 8px 24px rgba(14, 31, 53, 0.13);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 8px 0 14px;
+  background: radial-gradient(1200px 600px at 12% -10%, #ffffff 0%, transparent 60%),
+    linear-gradient(165deg, var(--bg-a) 0%, var(--bg-b) 100%);
+  color: var(--text-main);
+  font-family: "Avenir Next", "SF Pro Display", "Segoe UI", "Helvetica Neue", sans-serif;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.lang-switch {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  z-index: 20;
+  width: 108px;
+}
+
+h1 {
+  margin: 4px 0 10px;
+  text-align: center;
+  font-size: 34px;
+  line-height: 1.12;
+  letter-spacing: 0.4px;
+  color: #1a2533;
+  font-weight: 800;
+}
+
+.app {
+  width: min(1800px, 97.8vw);
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  background: rgba(255, 255, 255, 0.48);
+  border: 1px solid rgba(182, 194, 210, 0.48);
+  border-radius: 20px;
+  padding: 12px;
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(2px);
+}
+
+.btn {
+  height: 42px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: linear-gradient(180deg, #ffffff 0%, #f3f7fd 100%);
+  color: var(--text-main);
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s ease, border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.btn:hover {
+  border-color: #aac0dc;
+  box-shadow: 0 4px 14px rgba(31, 56, 91, 0.14);
+  transform: translateY(-1px);
+}
+
+.btn:active {
+  transform: translateY(0);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.btn-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.drop-area {
+  flex: 1;
+  border: 2px dashed #aab8cb;
+  border-radius: 18px;
+  background: linear-gradient(180deg, var(--surface) 0%, var(--surface-soft) 100%);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  min-height: 400px;
+  padding: 14px;
+  position: relative;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), var(--shadow-sm);
+}
+
+.drop-area img,
+.preview-canvas {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.frame-canvas,
+.token-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: auto;
+}
+
+.placeholder {
+  text-align: center;
+  font-size: 22px;
+  color: var(--text-soft);
+  line-height: 1.34;
+  white-space: pre-line;
+  max-width: 86%;
+}
+
+.center-controls {
+  display: flex;
+  gap: 8px;
+}
+
+.frame-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  color: #253547;
+  background: linear-gradient(180deg, #ffffff 0%, #f5f8fc 100%);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 10px;
+  min-height: 42px;
+  box-shadow: var(--shadow-sm);
+}
+
+select,
+input[type="range"] {
+  width: 100%;
+  height: 40px;
+  font-size: 15px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, #ffffff 0%, #f5f8fd 100%);
+  color: var(--text-main);
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+select:focus,
+input[type="range"]:focus,
+.btn:focus-visible,
+input[type="checkbox"]:focus-visible,
+input[type="radio"]:focus-visible {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--brand-strong);
+}
+
+.brush-controls {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  background: linear-gradient(180deg, #ffffff 0%, #f5f8fc 100%);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 10px;
+  box-shadow: var(--shadow-sm);
+}
+
+.brush-controls.show {
+  display: flex;
+}
+
+.preview-wrap {
+  flex: 1;
+  border: 2px solid var(--border-strong);
+  border-radius: 18px;
+  background: linear-gradient(180deg, var(--surface) 0%, var(--surface-soft) 100%);
+  position: relative;
+  overflow: hidden;
+  min-height: 400px;
+  padding: 14px;
+  cursor: default;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), var(--shadow-md);
+}
+
+.preview-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.cursor-overlay {
+  position: absolute;
+  border-radius: 50%;
+  border: 2px solid var(--accent-stroke);
+  background: var(--accent-fill);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  display: none;
+  z-index: 9;
+}
+
+.frame-brush-controls {
+  display: none;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  font-size: 15px;
+  color: #243446;
+  background: linear-gradient(180deg, #ffffff 0%, #f5f8fc 100%);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 10px;
+  min-height: 42px;
+  box-shadow: var(--shadow-sm);
+}
+
+.frame-brush-controls.show {
+  display: flex;
+}
+
+.brush-modes {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.brush-size-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.local-size-row {
+  display: none;
+}
+
+@media (max-width: 1200px) {
+  h1 {
+    font-size: 28px;
+    margin-top: 8px;
+  }
+
+  .app {
+    grid-template-columns: 1fr;
+    width: min(900px, 96vw);
+  }
+
+  .drop-area,
+  .preview-wrap {
+    min-height: 320px;
+  }
+
+  .column {
+    border-radius: 16px;
+  }
+}

@@ -155,6 +155,7 @@
         },
         paint: {
           active: false,
+          draggingPan: false,
           lastX: 0,
           lastY: 0,
           lastMouseX: 0,
@@ -181,6 +182,7 @@
         },
         paint: {
           active: false,
+          draggingPan: false,
           lastX: 0,
           lastY: 0,
           lastMouseX: 0,
@@ -317,6 +319,7 @@
         updateLocalSizeVisibility();
         if (!sideState.enabled) {
           sideState.paint.active = false;
+          sideState.paint.draggingPan = false;
           hideCursors();
         }
         requestLayoutRender();
@@ -389,7 +392,7 @@
         renderPreview();
       },
       onMouseDown: (event) => {
-        if (!sideState.source || !sideState.enabled) {
+        if (!sideState.source) {
           return;
         }
         if (event.button !== 0 && event.button !== 2) {
@@ -398,6 +401,17 @@
 
         const point = toPoint(sideUI.drop, event.clientX, event.clientY);
         if (!pointInRect(sideState.viewport.displayRect, point.x, point.y)) {
+          return;
+        }
+
+        if (!sideState.enabled) {
+          if (event.button !== 0) {
+            return;
+          }
+          sideState.paint.draggingPan = true;
+          sideState.paint.lastMouseX = point.x;
+          sideState.paint.lastMouseY = point.y;
+          event.preventDefault();
           return;
         }
 
@@ -423,8 +437,17 @@
         }
 
         const point = toPoint(sideUI.drop, event.clientX, event.clientY);
+        const prevMouseX = sideState.paint.lastMouseX;
+        const prevMouseY = sideState.paint.lastMouseY;
         sideState.paint.lastMouseX = point.x;
         sideState.paint.lastMouseY = point.y;
+
+        if (sideState.paint.draggingPan && !sideState.enabled) {
+          sideState.viewport.panX += point.x - prevMouseX;
+          sideState.viewport.panY += point.y - prevMouseY;
+          renderPreview();
+          return;
+        }
 
         if (sideState.enabled) {
           updateCursor(point.x, point.y);
@@ -465,6 +488,7 @@
       },
       onMouseUp: () => {
         sideState.paint.active = false;
+        sideState.paint.draggingPan = false;
       },
       onMouseLeave: () => {
         if (!sideState.paint.active) {

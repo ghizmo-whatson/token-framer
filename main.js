@@ -73,6 +73,12 @@
         "Удаляет цвета только в области фиолетовой кисти по цветам из красной кисти; правая кнопка мыши отменяет действие и возвращает удаленные цвета.",
       tipFrameModeEraser:
         "Стирает части рамки кистью; правая кнопка мыши отменяет действие и возвращает стертые участки.",
+      tipTokenCanvasPan:
+        "В этой области можно перемещать изображение средней кнопкой мыши; при выключенной галочке инструментов также работает перетаскивание левой кнопкой.",
+      tipFrameCanvasPan:
+        "В этой области можно перемещать рамку средней кнопкой мыши; при выключенной галочке инструментов также работает перетаскивание левой кнопкой.",
+      tipCenterCanvasPan:
+        "В центральной области можно перемещать изображение средней кнопкой мыши в любом режиме. В режиме Маска: левая кнопка рисует маску, правая стирает.",
     },
     en: {
       title: "Image + Frame Mixer",
@@ -125,6 +131,12 @@
         "Removes colors only inside the purple brush area using colors sampled by the red brush; right mouse button inverts the action and restores removed colors.",
       tipFrameModeEraser:
         "Erases frame parts with the brush; right mouse button inverts the action and restores erased areas.",
+      tipTokenCanvasPan:
+        "In this area you can pan the image with the middle mouse button; when tool checkbox is off, left mouse drag also pans.",
+      tipFrameCanvasPan:
+        "In this area you can pan the frame with the middle mouse button; when tool checkbox is off, left mouse drag also pans.",
+      tipCenterCanvasPan:
+        "In the center area you can pan with the middle mouse button in any mode. In Mask mode: left button paints the mask, right button erases it.",
     },
   };
 
@@ -201,6 +213,7 @@
       baseOffsetY: 0,
       brushSize: 30,
       draggingOffset: false,
+      draggingPan: false,
       paintingMask: false,
       erasingMask: false,
       lastMouseX: 0,
@@ -395,7 +408,7 @@
         if (!sideState.source) {
           return;
         }
-        if (event.button !== 0 && event.button !== 2) {
+        if (event.button !== 0 && event.button !== 1 && event.button !== 2) {
           return;
         }
 
@@ -404,14 +417,15 @@
           return;
         }
 
-        if (!sideState.enabled) {
-          if (event.button !== 0) {
-            return;
-          }
+        if (event.button === 1 || (!sideState.enabled && event.button === 0)) {
           sideState.paint.draggingPan = true;
           sideState.paint.lastMouseX = point.x;
           sideState.paint.lastMouseY = point.y;
           event.preventDefault();
+          return;
+        }
+
+        if (!sideState.enabled) {
           return;
         }
 
@@ -442,7 +456,7 @@
         sideState.paint.lastMouseX = point.x;
         sideState.paint.lastMouseY = point.y;
 
-        if (sideState.paint.draggingPan && !sideState.enabled) {
+        if (sideState.paint.draggingPan) {
           sideState.viewport.panX += point.x - prevMouseX;
           sideState.viewport.panY += point.y - prevMouseY;
           renderPreview();
@@ -849,6 +863,12 @@
       return;
     }
 
+    if (event.button === 1) {
+      state.center.draggingPan = true;
+      event.preventDefault();
+      return;
+    }
+
     if (state.appMode === MODES.MASK) {
       if (event.button !== 0 && event.button !== 2) {
         return;
@@ -874,6 +894,17 @@
 
   function onCenterMouseMove(event) {
     const point = toPoint(ui.center.wrap, event.clientX, event.clientY);
+
+    if (state.center.draggingPan) {
+      const dx = point.x - state.center.lastMouseX;
+      const dy = point.y - state.center.lastMouseY;
+      state.center.lastMouseX = point.x;
+      state.center.lastMouseY = point.y;
+      state.center.panX += dx;
+      state.center.panY += dy;
+      renderCenterPreview();
+      return;
+    }
 
     if (state.appMode === MODES.MASK) {
       state.center.lastMouseX = point.x;
@@ -924,6 +955,7 @@
 
   function onCenterMouseUp() {
     state.center.draggingOffset = false;
+    state.center.draggingPan = false;
     state.center.paintingMask = false;
     state.center.erasingMask = false;
   }
@@ -1912,6 +1944,13 @@
     center.scaleSelect.title = t("tipCenterScale");
     center.tokenScaleSelect.title = t("tipTokenScale");
     center.downloadBtn.title = t("tipDownload");
+
+    ui.token.drop.title = t("tipTokenCanvasPan");
+    ui.token.canvas.title = t("tipTokenCanvasPan");
+    ui.frame.drop.title = t("tipFrameCanvasPan");
+    ui.frame.canvas.title = t("tipFrameCanvasPan");
+    center.wrap.title = t("tipCenterCanvasPan");
+    center.canvas.title = t("tipCenterCanvasPan");
 
     ui.token.modeInputs.forEach((input) => {
       if (input.value === BRUSH_MODES.COLOR) {

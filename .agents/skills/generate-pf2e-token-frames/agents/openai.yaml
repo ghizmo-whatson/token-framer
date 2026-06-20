@@ -1,0 +1,4 @@
+interface:
+  display_name: "PF2e Token Frame Generator"
+  short_description: "Generate verified transparent circular frames"
+  default_prompt: "Use $generate-pf2e-token-frames to create a perfectly circular transparent PF2e token frame from my visual prompt."

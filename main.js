@@ -20,6 +20,19 @@
     FRAME: "frame",
   };
 
+  // Presets are discovered dynamically (no hardcoded file names): the app reads the
+  // contents of PRESETS.dir either from a same-origin directory listing (works with
+  // dev servers like `python -m http.server`) or from the GitHub Contents API (works
+  // on GitHub Pages). To add new presets, just drop image files into the folder and
+  // commit/push them. The image itself is always loaded from a same-origin URL so the
+  // result canvas stays untainted (CORS-safe) for download/composition.
+  const PRESETS = {
+    dir: "ai_generated",
+    imageExtensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif"],
+    fallbackRepo: { owner: "atbakalov95", repo: "token-framer", branch: "main" },
+    cache: null,
+  };
+
   const I18N = {
     ru: {
       title: "Image + Frame Mixer",
@@ -49,6 +62,14 @@
       alertPastedUnreadable: "Вставленное содержимое не удалось прочитать как изображение.",
       alertClipboardNoImage: "В буфере нет изображения для вставки.",
       alertSaveFailed: "Не удалось сохранить изображение.",
+      presetsButton: "Пресеты",
+      presetsTitle: "Пресеты рамок",
+      presetsDisclaimer: "Все пресеты сгенерированы нейросетью.",
+      presetsLoading: "Загрузка пресетов…",
+      presetsEmpty: "Пресеты не найдены. Добавьте изображения в папку ai_generated.",
+      presetsError: "Не удалось загрузить список пресетов. Проверьте подключение к сети.",
+      presetsClose: "Закрыть",
+      tipPresets: "Открывает галерею готовых пресетов рамок для вставки в правое окно.",
       tipLangSelect: "Переключает язык интерфейса приложения.",
       tipPasteToken: "Вставляет изображение из буфера обмена в левое окно токена.",
       tipUndoToken: "Сбрасывает все правки токена: удаление цвета и ластик.",
@@ -107,6 +128,14 @@
       alertPastedUnreadable: "Pasted content could not be read as an image.",
       alertClipboardNoImage: "There is no image in the clipboard.",
       alertSaveFailed: "Failed to save image.",
+      presetsButton: "Presets",
+      presetsTitle: "Frame Presets",
+      presetsDisclaimer: "All presets are AI-generated.",
+      presetsLoading: "Loading presets…",
+      presetsEmpty: "No presets found. Add images to the ai_generated folder.",
+      presetsError: "Failed to load the preset list. Check your network connection.",
+      presetsClose: "Close",
+      tipPresets: "Opens a gallery of ready-made frame presets to load into the right panel.",
       tipLangSelect: "Switches the application interface language.",
       tipPasteToken: "Pastes an image from clipboard into the left token panel.",
       tipUndoToken: "Resets all token edits: color removal and eraser strokes.",
@@ -237,6 +266,7 @@
   let layoutRenderScheduled = false;
 
   setupAppEvents();
+  setupPresets();
   renderAll();
 
   function bindUI() {
@@ -309,6 +339,15 @@
         frameModeEraserLabel: document.getElementById("frameModeEraserLabel"),
         frameDropPlaceholder: document.getElementById("frameDropPlaceholder"),
         previewPlaceholder: document.getElementById("previewPlaceholder"),
+      },
+      presets: {
+        openBtn: document.getElementById("framePresetsBtn"),
+        modal: document.getElementById("presetsModal"),
+        closeBtn: document.getElementById("presetsCloseBtn"),
+        title: document.getElementById("presetsModalTitle"),
+        disclaimer: document.getElementById("presetsDisclaimer"),
+        status: document.getElementById("presetsStatus"),
+        grid: document.getElementById("presetsGrid"),
       },
     };
   }
@@ -1694,9 +1733,12 @@
     });
   }
 
-  function srcToImage(src) {
+  function srcToImage(src, crossOrigin) {
     return new Promise((resolve) => {
       const image = new Image();
+      if (crossOrigin) {
+        image.crossOrigin = "anonymous";
+      }
       image.onload = () => resolve(image);
       image.onerror = () => resolve(null);
       image.src = src;
@@ -1723,6 +1765,227 @@
       anchor.remove();
       URL.revokeObjectURL(url);
     }, "image/png");
+  }
+
+  function setupPresets() {
+    const p = ui.presets;
+
+    p.openBtn.addEventListener("click", openPresetsModal);
+    p.closeBtn.addEventListener("click", closePresetsModal);
+    p.modal.addEventListener("mousedown", (event) => {
+      if (event.target === p.modal) {
+        closePresetsModal();
+      }
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !p.modal.hidden) {
+        closePresetsModal();
+      }
+    });
+  }
+
+  async function openPresetsModal() {
+    const p = ui.presets;
+    p.modal.hidden = false;
+
+    if (PRESETS.cache) {
+      renderPresetCards(PRESETS.cache);
+      return;
+    }
+
+    p.grid.innerHTML = "";
+    p.status.textContent = t("presetsLoading");
+
+    let list = [];
+    try {
+      list = await loadPresetList();
+    } catch (_) {
+      p.status.textContent = t("presetsError");
+      return;
+    }
+
+    if (!list.length) {
+      p.status.textContent = t("presetsEmpty");
+      return;
+    }
+
+    PRESETS.cache = list;
+    renderPresetCards(list);
+  }
+
+  function closePresetsModal() {
+    ui.presets.modal.hidden = true;
+  }
+
+  function renderPresetCards(list) {
+    const p = ui.presets;
+    p.status.textContent = "";
+    p.grid.innerHTML = "";
+
+    for (const preset of list) {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "preset-card";
+      card.title = preset.name;
+
+      const thumb = document.createElement("img");
+      thumb.className = "preset-thumb";
+      thumb.loading = "lazy";
+      thumb.alt = preset.name;
+      // Try the local copy ("next to" the HTML) first; if it is missing, fall back
+      // to the GitHub-hosted copy.
+      thumb.src = preset.localUrl;
+      if (preset.rawUrl) {
+        thumb.addEventListener("error", function onThumbError() {
+          thumb.removeEventListener("error", onThumbError);
+          thumb.src = preset.rawUrl;
+        });
+      }
+
+      const name = document.createElement("span");
+      name.className = "preset-name";
+      name.textContent = prettyPresetName(preset.name);
+
+      card.appendChild(thumb);
+      card.appendChild(name);
+      card.addEventListener("click", () => applyPreset(preset));
+      p.grid.appendChild(card);
+    }
+  }
+
+  async function applyPreset(preset) {
+    // Prefer the local file sitting next to the page (works on a deployed site and on
+    // a local web server). If it is absent or unusable (e.g. a file:// page where the
+    // canvas would be tainted), fall back to the GitHub-hosted copy via CORS.
+    let canvas = await loadUsableCanvas(preset.localUrl, false);
+    if (!canvas && preset.rawUrl) {
+      canvas = await loadUsableCanvas(preset.rawUrl, true);
+    }
+    if (!canvas) {
+      alert(t("alertBadImage"));
+      return;
+    }
+    sideControllers.frame.setSource(canvas);
+    closePresetsModal();
+  }
+
+  async function loadUsableCanvas(url, crossOrigin) {
+    if (!url) {
+      return null;
+    }
+    const image = await srcToImage(url, crossOrigin);
+    if (!image) {
+      return null;
+    }
+    const canvas = drawableToCanvas(image);
+    try {
+      // Verify the canvas is readable (not tainted). A tainted canvas would later make
+      // "Download" and the color tools throw a SecurityError, so we reject it here and
+      // let the caller try the next source.
+      canvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, 1, 1);
+      return canvas;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function loadPresetList() {
+    let list = await listPresetsFromDirectoryIndex();
+    if (!list.length) {
+      list = await listPresetsFromGitHub();
+    }
+    list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+    return list;
+  }
+
+  async function listPresetsFromDirectoryIndex() {
+    try {
+      const response = await fetch(`${PRESETS.dir}/`, { headers: { Accept: "text/html" } });
+      if (!response.ok) {
+        return [];
+      }
+      const html = await response.text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const anchors = Array.from(doc.querySelectorAll("a[href]"));
+      const seen = new Set();
+      const presets = [];
+
+      for (const anchor of anchors) {
+        const href = anchor.getAttribute("href") || "";
+        const name = decodeURIComponent((href.split("?")[0].split("#")[0].split("/").filter(Boolean).pop() || ""));
+        if (!name || seen.has(name) || !isImageName(name)) {
+          continue;
+        }
+        seen.add(name);
+        presets.push(makePreset(name));
+      }
+
+      return presets;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async function listPresetsFromGitHub() {
+    const repo = resolveGitHubRepo();
+    if (!repo) {
+      return [];
+    }
+    try {
+      const endpoint = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${PRESETS.dir}?ref=${repo.branch}`;
+      const response = await fetch(endpoint, { headers: { Accept: "application/vnd.github+json" } });
+      if (!response.ok) {
+        return [];
+      }
+      const items = await response.json();
+      if (!Array.isArray(items)) {
+        return [];
+      }
+      return items
+        .filter((item) => item.type === "file" && isImageName(item.name))
+        .map((item) => makePreset(item.name, item.download_url));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function resolveGitHubRepo() {
+    const host = location.hostname;
+    if (host.endsWith(".github.io")) {
+      const owner = host.slice(0, host.length - ".github.io".length);
+      const repo = location.pathname.split("/").filter(Boolean)[0];
+      if (owner && repo) {
+        return { owner, repo, branch: PRESETS.fallbackRepo.branch };
+      }
+    }
+    return PRESETS.fallbackRepo;
+  }
+
+  function makePreset(name, rawUrl) {
+    return {
+      name,
+      // Same-origin path ("next to" the page) — used first.
+      localUrl: `${PRESETS.dir}/${encodeURIComponent(name)}`,
+      // GitHub-hosted copy — used as a fallback (and for thumbnails over file://).
+      rawUrl: rawUrl || buildRawUrl(name),
+    };
+  }
+
+  function buildRawUrl(name) {
+    const repo = resolveGitHubRepo();
+    if (!repo) {
+      return null;
+    }
+    return `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${PRESETS.dir}/${encodeURIComponent(name)}`;
+  }
+
+  function isImageName(name) {
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    return PRESETS.imageExtensions.includes(ext);
+  }
+
+  function prettyPresetName(name) {
+    return name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
   }
 
   function updateCenterCursorFromLast() {
@@ -1884,6 +2147,14 @@
     app.previewPlaceholder.textContent = t("placeholderPreview");
 
     ui.center.downloadBtn.textContent = t("download");
+
+    ui.presets.openBtn.textContent = t("presetsButton");
+    ui.presets.openBtn.title = t("tipPresets");
+    ui.presets.title.textContent = t("presetsTitle");
+    ui.presets.disclaimer.textContent = t("presetsDisclaimer");
+    ui.presets.closeBtn.setAttribute("aria-label", t("presetsClose"));
+    ui.presets.closeBtn.title = t("presetsClose");
+
     ui.center.modeSelect.setAttribute("aria-label", t("centerModeLabel"));
     ui.center.scaleSelect.setAttribute("aria-label", t("centerScaleLabel"));
     ui.center.tokenScaleSelect.setAttribute("aria-label", t("centerTokenScaleLabel"));

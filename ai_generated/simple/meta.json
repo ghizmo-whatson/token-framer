@@ -1,0 +1,11 @@
+{
+  "order": 10,
+  "name": {
+    "ru": "Простые",
+    "en": "Simple"
+  },
+  "description": {
+    "ru": "Базовые минималистичные и однотонные рамки.",
+    "en": "Basic minimalist and solid-color frames."
+  }
+}

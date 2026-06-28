@@ -1,0 +1,11 @@
+{
+  "order": 40,
+  "name": {
+    "ru": "Природные",
+    "en": "Primal"
+  },
+  "description": {
+    "ru": "Базовые рамки связанные с природой.",
+    "en": "Basic primal frames."
+  }
+}

@@ -23,11 +23,16 @@
   // Presets are discovered dynamically (no hardcoded file names): the app reads the
   // contents of PRESETS.dir either from a same-origin directory listing (works with
   // dev servers like `python -m http.server`) or from the GitHub Contents API (works
-  // on GitHub Pages). To add new presets, just drop image files into the folder and
-  // commit/push them. The image itself is always loaded from a same-origin URL so the
-  // result canvas stays untainted (CORS-safe) for download/composition.
+  // on GitHub Pages). Presets are grouped into categories — each first-level subfolder
+  // of PRESETS.dir is a category. A category folder may contain a `meta.json` file
+  // describing its localized name/description (see loadCategoryMeta). Images that still
+  // live directly in PRESETS.dir (not yet sorted into a folder) are shown under a
+  // transitional "uncategorized" group. To add a preset, drop the image into the right
+  // category folder and commit/push it. The image itself is always loaded from a
+  // same-origin URL so the result canvas stays untainted (CORS-safe) for download.
   const PRESETS = {
     dir: "ai_generated",
+    metaFile: "meta.json",
     imageExtensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif"],
     fallbackRepo: { owner: "atbakalov95", repo: "token-framer", branch: "main" },
     cache: null,
@@ -66,9 +71,14 @@
       presetsTitle: "Пресеты рамок",
       presetsDisclaimer: "Все пресеты сгенерированы нейросетью.",
       presetsLoading: "Загрузка пресетов…",
-      presetsEmpty: "Пресеты не найдены. Добавьте изображения в папку ai_generated.",
+      presetsEmpty: "Категории не найдены. Добавьте папки с изображениями в ai_generated.",
+      presetsCategoryEmpty: "В этой категории пока нет рамок.",
       presetsError: "Не удалось загрузить список пресетов. Проверьте подключение к сети.",
       presetsClose: "Закрыть",
+      presetsBack: "← Назад",
+      presetsCount: "Рамок: {count}",
+      presetsUncategorized: "Без категории",
+      presetsUncategorizedDesc: "Рамки, ещё не распределённые по категориям.",
       tipPresets: "Открывает галерею готовых пресетов рамок для вставки в правое окно.",
       tipLangSelect: "Переключает язык интерфейса приложения.",
       tipPasteToken: "Вставляет изображение из буфера обмена в левое окно токена.",
@@ -132,9 +142,14 @@
       presetsTitle: "Frame Presets",
       presetsDisclaimer: "All presets are AI-generated.",
       presetsLoading: "Loading presets…",
-      presetsEmpty: "No presets found. Add images to the ai_generated folder.",
+      presetsEmpty: "No categories found. Add image folders to the ai_generated folder.",
+      presetsCategoryEmpty: "This category has no frames yet.",
       presetsError: "Failed to load the preset list. Check your network connection.",
       presetsClose: "Close",
+      presetsBack: "← Back",
+      presetsCount: "Frames: {count}",
+      presetsUncategorized: "Uncategorized",
+      presetsUncategorizedDesc: "Frames not yet sorted into a category.",
       tipPresets: "Opens a gallery of ready-made frame presets to load into the right panel.",
       tipLangSelect: "Switches the application interface language.",
       tipPasteToken: "Pastes an image from clipboard into the left token panel.",
@@ -344,8 +359,10 @@
         openBtn: document.getElementById("framePresetsBtn"),
         modal: document.getElementById("presetsModal"),
         closeBtn: document.getElementById("presetsCloseBtn"),
+        backBtn: document.getElementById("presetsBackBtn"),
         title: document.getElementById("presetsModalTitle"),
         disclaimer: document.getElementById("presetsDisclaimer"),
+        categoryDesc: document.getElementById("presetsCategoryDesc"),
         status: document.getElementById("presetsStatus"),
         grid: document.getElementById("presetsGrid"),
       },
@@ -1767,18 +1784,28 @@
     }, "image/png");
   }
 
+  // Which category is currently open in the modal (null = the category list view).
+  let presetsCurrentCategory = null;
+
   function setupPresets() {
     const p = ui.presets;
 
     p.openBtn.addEventListener("click", openPresetsModal);
     p.closeBtn.addEventListener("click", closePresetsModal);
+    p.backBtn.addEventListener("click", showCategoryList);
     p.modal.addEventListener("mousedown", (event) => {
       if (event.target === p.modal) {
         closePresetsModal();
       }
     });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && !p.modal.hidden) {
+      if (event.key !== "Escape" || p.modal.hidden) {
+        return;
+      }
+      // Esc first steps back from a category to the category list, then closes.
+      if (presetsCurrentCategory) {
+        showCategoryList();
+      } else {
         closePresetsModal();
       }
     });
@@ -1789,58 +1816,143 @@
     p.modal.hidden = false;
 
     if (PRESETS.cache) {
-      renderPresetCards(PRESETS.cache);
+      showCategoryList();
       return;
     }
 
+    presetsCurrentCategory = null;
+    setPresetsHeader(null);
     p.grid.innerHTML = "";
     p.status.textContent = t("presetsLoading");
 
-    let list = [];
+    let categories = [];
     try {
-      list = await loadPresetList();
+      categories = await loadCategories();
     } catch (_) {
       p.status.textContent = t("presetsError");
       return;
     }
 
-    if (!list.length) {
+    if (!categories.length) {
       p.status.textContent = t("presetsEmpty");
       return;
     }
 
-    PRESETS.cache = list;
-    renderPresetCards(list);
+    PRESETS.cache = categories;
+    showCategoryList();
   }
 
   function closePresetsModal() {
     ui.presets.modal.hidden = true;
   }
 
-  function renderPresetCards(list) {
+  // Switches the modal header between the category list view (category === null) and a
+  // single-category view (showing its localized name + description and a Back button).
+  function setPresetsHeader(category) {
+    const p = ui.presets;
+    if (!category) {
+      p.backBtn.hidden = true;
+      p.title.textContent = t("presetsTitle");
+      p.disclaimer.hidden = false;
+      p.categoryDesc.hidden = true;
+      p.categoryDesc.textContent = "";
+      return;
+    }
+    p.backBtn.hidden = false;
+    p.backBtn.textContent = t("presetsBack");
+    p.title.textContent = categoryName(category);
+    p.disclaimer.hidden = true;
+    const desc = categoryDescription(category);
+    p.categoryDesc.textContent = desc;
+    p.categoryDesc.hidden = !desc;
+  }
+
+  function showCategoryList() {
+    presetsCurrentCategory = null;
+    setPresetsHeader(null);
+    renderCategoryCards(PRESETS.cache || []);
+  }
+
+  function showCategory(category) {
+    presetsCurrentCategory = category;
+    setPresetsHeader(category);
+    renderPresetCards(category.presets);
+  }
+
+  function renderCategoryCards(categories) {
     const p = ui.presets;
     p.status.textContent = "";
     p.grid.innerHTML = "";
+
+    for (const category of categories) {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "preset-card category-card";
+      card.title = categoryName(category);
+
+      card.appendChild(buildCategoryThumb(category));
+
+      const name = document.createElement("span");
+      name.className = "preset-name";
+      name.textContent = categoryName(category);
+
+      const count = document.createElement("span");
+      count.className = "category-count";
+      count.textContent = t("presetsCount", { count: category.presets.length });
+
+      card.appendChild(name);
+      card.appendChild(count);
+      card.addEventListener("click", () => showCategory(category));
+      p.grid.appendChild(card);
+    }
+  }
+
+  // Builds a small cover for a category: a collage of up to four of its frame thumbnails
+  // (or a folder glyph when the category is still empty).
+  function buildCategoryThumb(category) {
+    const thumb = document.createElement("div");
+    thumb.className = "category-thumb";
+
+    const covers = category.presets.slice(0, 4);
+    if (!covers.length) {
+      thumb.classList.add("category-thumb--empty");
+      thumb.textContent = "📁";
+      return thumb;
+    }
+    if (covers.length === 1) {
+      thumb.classList.add("category-thumb--single");
+    }
+    for (const preset of covers) {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.alt = "";
+      setPresetThumbSrc(img, preset);
+      thumb.appendChild(img);
+    }
+    return thumb;
+  }
+
+  function renderPresetCards(list) {
+    const p = ui.presets;
+    p.grid.innerHTML = "";
+
+    if (!list.length) {
+      p.status.textContent = t("presetsCategoryEmpty");
+      return;
+    }
+    p.status.textContent = "";
 
     for (const preset of list) {
       const card = document.createElement("button");
       card.type = "button";
       card.className = "preset-card";
-      card.title = preset.name;
+      card.title = prettyPresetName(preset.name);
 
       const thumb = document.createElement("img");
       thumb.className = "preset-thumb";
       thumb.loading = "lazy";
-      thumb.alt = preset.name;
-      // Try the local copy ("next to" the HTML) first; if it is missing, fall back
-      // to the GitHub-hosted copy.
-      thumb.src = preset.localUrl;
-      if (preset.rawUrl) {
-        thumb.addEventListener("error", function onThumbError() {
-          thumb.removeEventListener("error", onThumbError);
-          thumb.src = preset.rawUrl;
-        });
-      }
+      thumb.alt = prettyPresetName(preset.name);
+      setPresetThumbSrc(thumb, preset);
 
       const name = document.createElement("span");
       name.className = "preset-name";
@@ -1850,6 +1962,18 @@
       card.appendChild(name);
       card.addEventListener("click", () => applyPreset(preset));
       p.grid.appendChild(card);
+    }
+  }
+
+  // Loads an <img> from the local copy ("next to" the HTML) first; if that 404s, falls
+  // back to the GitHub-hosted copy.
+  function setPresetThumbSrc(img, preset) {
+    img.src = preset.localUrl;
+    if (preset.rawUrl) {
+      img.addEventListener("error", function onThumbError() {
+        img.removeEventListener("error", onThumbError);
+        img.src = preset.rawUrl;
+      });
     }
   }
 
@@ -1889,63 +2013,193 @@
     }
   }
 
-  async function loadPresetList() {
-    let list = await listPresetsFromDirectoryIndex();
-    if (!list.length) {
-      list = await listPresetsFromGitHub();
+  // Builds the list of categories: one per first-level subfolder of PRESETS.dir, plus a
+  // transitional "uncategorized" group for images that still sit directly in PRESETS.dir.
+  async function loadCategories() {
+    const root = await listDir(PRESETS.dir);
+    const categories = [];
+
+    for (const folder of root.dirs) {
+      const sub = await listDir(`${PRESETS.dir}/${folder}`);
+      const images = sub.files.filter(isImageName);
+      const meta = await loadCategoryMeta(folder);
+      categories.push(makeCategory(folder, images, meta));
     }
-    list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
-    return list;
+
+    const looseImages = root.files.filter(isImageName);
+    if (looseImages.length) {
+      categories.push(makeUncategorizedCategory(looseImages));
+    }
+
+    categories.sort(compareCategories);
+    return categories;
   }
 
-  async function listPresetsFromDirectoryIndex() {
+  // Categories are ordered by their `order` field (from meta.json), then alphabetically;
+  // the uncategorized group always sinks to the bottom.
+  function compareCategories(a, b) {
+    if (a.order !== b.order) {
+      return a.order - b.order;
+    }
+    return a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
+  }
+
+  function makeCategory(folder, imageNames, meta) {
+    const order = meta && Number.isFinite(meta.order) ? meta.order : 1000;
+    return {
+      id: folder,
+      meta: meta || null,
+      order,
+      uncategorized: false,
+      presets: sortedPresets(imageNames, folder),
+    };
+  }
+
+  function makeUncategorizedCategory(imageNames) {
+    return {
+      id: "",
+      meta: null,
+      order: Number.MAX_SAFE_INTEGER,
+      uncategorized: true,
+      presets: sortedPresets(imageNames, ""),
+    };
+  }
+
+  function sortedPresets(imageNames, folder) {
+    return imageNames
+      .slice()
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
+      .map((name) => makePreset(name, folder));
+  }
+
+  function categoryName(category) {
+    if (category.uncategorized) {
+      return t("presetsUncategorized");
+    }
+    return localizedMeta(category.meta, "name") || prettyPresetName(category.id);
+  }
+
+  function categoryDescription(category) {
+    if (category.uncategorized) {
+      return t("presetsUncategorizedDesc");
+    }
+    return localizedMeta(category.meta, "description");
+  }
+
+  // Reads a localized string from a meta field that may be either a plain string or a
+  // map of language code -> string (e.g. { ru: "...", en: "..." }).
+  function localizedMeta(meta, field) {
+    if (!meta || !meta[field]) {
+      return "";
+    }
+    const value = meta[field];
+    if (typeof value === "string") {
+      return value;
+    }
+    return value[state.language] || value[LANG.RU] || value[LANG.EN] || "";
+  }
+
+  async function loadCategoryMeta(folder) {
+    const rel = `${folder}/${PRESETS.metaFile}`;
+    let meta = await fetchJson(`${PRESETS.dir}/${encodePresetPath(rel)}`);
+    if (!meta) {
+      const raw = buildRawUrl(rel);
+      if (raw) {
+        meta = await fetchJson(raw);
+      }
+    }
+    return meta;
+  }
+
+  async function fetchJson(url) {
     try {
-      const response = await fetch(`${PRESETS.dir}/`, { headers: { Accept: "text/html" } });
+      const response = await fetch(url, { headers: { Accept: "application/json" } });
       if (!response.ok) {
-        return [];
+        return null;
       }
-      const html = await response.text();
-      const doc = new DOMParser().parseFromString(html, "text/html");
-      const anchors = Array.from(doc.querySelectorAll("a[href]"));
-      const seen = new Set();
-      const presets = [];
-
-      for (const anchor of anchors) {
-        const href = anchor.getAttribute("href") || "";
-        const name = decodeURIComponent((href.split("?")[0].split("#")[0].split("/").filter(Boolean).pop() || ""));
-        if (!name || seen.has(name) || !isImageName(name)) {
-          continue;
-        }
-        seen.add(name);
-        presets.push(makePreset(name));
-      }
-
-      return presets;
+      return await response.json();
     } catch (_) {
-      return [];
+      return null;
     }
   }
 
-  async function listPresetsFromGitHub() {
+  // Lists a directory's child folders and files. Tries a same-origin directory index
+  // first (dev servers), then the GitHub Contents API (GitHub Pages). Returns
+  // { dirs, files } — empty arrays when nothing could be listed.
+  async function listDir(relPath) {
+    const fromIndex = await listDirFromIndex(relPath);
+    if (fromIndex) {
+      return fromIndex;
+    }
+    const fromGitHub = await listDirFromGitHub(relPath);
+    if (fromGitHub) {
+      return fromGitHub;
+    }
+    return { dirs: [], files: [] };
+  }
+
+  async function listDirFromIndex(relPath) {
+    try {
+      const response = await fetch(`${encodePresetPath(relPath)}/`, { headers: { Accept: "text/html" } });
+      if (!response.ok) {
+        return null;
+      }
+      return parseDirIndex(await response.text());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function parseDirIndex(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const anchors = Array.from(doc.querySelectorAll("a[href]"));
+    const dirs = [];
+    const files = [];
+    const seen = new Set();
+
+    for (const anchor of anchors) {
+      const raw = (anchor.getAttribute("href") || "").split("?")[0].split("#")[0];
+      const isDir = raw.endsWith("/");
+      const name = decodeURIComponent(raw.replace(/\/+$/, ""));
+      // Keep only direct children: a bare "name" or "name/". Skip parent ("..") and any
+      // nested/absolute hrefs (those contain a slash after trimming the trailing one).
+      if (!name || name === ".." || name.includes("/") || seen.has(name)) {
+        continue;
+      }
+      seen.add(name);
+      (isDir ? dirs : files).push(name);
+    }
+
+    return { dirs, files };
+  }
+
+  async function listDirFromGitHub(relPath) {
     const repo = resolveGitHubRepo();
     if (!repo) {
-      return [];
+      return null;
     }
     try {
-      const endpoint = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${PRESETS.dir}?ref=${repo.branch}`;
+      const endpoint = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${encodePresetPath(relPath)}?ref=${repo.branch}`;
       const response = await fetch(endpoint, { headers: { Accept: "application/vnd.github+json" } });
       if (!response.ok) {
-        return [];
+        return null;
       }
       const items = await response.json();
       if (!Array.isArray(items)) {
-        return [];
+        return null;
       }
-      return items
-        .filter((item) => item.type === "file" && isImageName(item.name))
-        .map((item) => makePreset(item.name, item.download_url));
+      const dirs = [];
+      const files = [];
+      for (const item of items) {
+        if (item.type === "dir") {
+          dirs.push(item.name);
+        } else if (item.type === "file") {
+          files.push(item.name);
+        }
+      }
+      return { dirs, files };
     } catch (_) {
-      return [];
+      return null;
     }
   }
 
@@ -1961,22 +2215,34 @@
     return PRESETS.fallbackRepo;
   }
 
-  function makePreset(name, rawUrl) {
+  // `relPath` is relative to PRESETS.dir (e.g. "simple/foo.png" or just "foo.png").
+  function makePreset(name, folder) {
+    const rel = folder ? `${folder}/${name}` : name;
     return {
       name,
       // Same-origin path ("next to" the page) — used first.
-      localUrl: `${PRESETS.dir}/${encodeURIComponent(name)}`,
+      localUrl: `${PRESETS.dir}/${encodePresetPath(rel)}`,
       // GitHub-hosted copy — used as a fallback (and for thumbnails over file://).
-      rawUrl: rawUrl || buildRawUrl(name),
+      rawUrl: buildRawUrl(rel),
     };
   }
 
-  function buildRawUrl(name) {
+  function buildRawUrl(relPath) {
     const repo = resolveGitHubRepo();
     if (!repo) {
       return null;
     }
-    return `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${PRESETS.dir}/${encodeURIComponent(name)}`;
+    return `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${PRESETS.dir}/${encodePresetPath(relPath)}`;
+  }
+
+  // Encodes each path segment so spaces/special characters are URL-safe while keeping the
+  // slash separators intact.
+  function encodePresetPath(relPath) {
+    return String(relPath)
+      .split("/")
+      .filter(Boolean)
+      .map(encodeURIComponent)
+      .join("/");
   }
 
   function isImageName(name) {
@@ -2173,6 +2439,16 @@
     updateSideBrushLabels(SIDE.TOKEN);
     updateSideBrushLabels(SIDE.FRAME);
     updateCenterBrushLabel();
+
+    // If the presets modal is open, re-render it so localized category names and
+    // descriptions update immediately on a language switch.
+    if (!ui.presets.modal.hidden && PRESETS.cache) {
+      if (presetsCurrentCategory) {
+        showCategory(presetsCurrentCategory);
+      } else {
+        showCategoryList();
+      }
+    }
   }
 
   function updateTokenScaleOptionLabels() {

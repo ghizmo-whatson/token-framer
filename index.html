@@ -145,12 +145,14 @@
   <div id="presetsModal" class="modal-overlay" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="presetsModalTitle">
       <div class="modal-header">
+        <button id="presetsBackBtn" class="modal-back" type="button" hidden>← Назад</button>
         <h2 id="presetsModalTitle" class="modal-title">Пресеты рамок</h2>
         <button id="presetsCloseBtn" class="modal-close" type="button" aria-label="Закрыть">×</button>
       </div>
       <p id="presetsDisclaimer" class="modal-disclaimer">
         Все пресеты сгенерированы нейросетью.
       </p>
+      <p id="presetsCategoryDesc" class="modal-category-desc" hidden></p>
       <div id="presetsStatus" class="modal-status"></div>
       <div id="presetsGrid" class="presets-grid"></div>
     </div>

@@ -1,0 +1,11 @@
+{
+  "order": 20,
+  "name": {
+    "ru": "Классы",
+    "en": "Classes"
+  },
+  "description": {
+    "ru": "Тематические рамки для классов персонажей.",
+    "en": "Themed frames for character classes."
+  }
+}

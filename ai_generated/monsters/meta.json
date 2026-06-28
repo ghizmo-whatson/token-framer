@@ -1,0 +1,11 @@
+{
+  "order": 40,
+  "name": {
+    "ru": "Монструозные",
+    "en": "Monsters"
+  },
+  "description": {
+    "ru": "Базовые рамки для монстров.",
+    "en": "Basic monster frames."
+  }
+}

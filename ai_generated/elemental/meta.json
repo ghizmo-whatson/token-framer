@@ -1,0 +1,11 @@
+{
+  "order": 30,
+  "name": {
+    "ru": "Стихийные",
+    "en": "Elemental"
+  },
+  "description": {
+    "ru": "Базовые стихийные рамки.",
+    "en": "Basic elemental-related frames."
+  }
+}

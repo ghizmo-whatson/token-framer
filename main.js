@@ -1,3 +1,937 @@
+/* Token Framer — all application JavaScript lives in this file.
+ * Sections: tooltips, background engine/Worker, smart-removal panels, editor.
+ * No imports, build step or separate worker script are required.
+ */
+
+/* ==================== TOOLTIPS ==================== */
+// 1. Tooltips and setting explanations
+/* One floating tooltip for settings: not clipped by a scrolling brush panel. */
+(function (root) {
+  "use strict";
+  const popup = document.createElement("div");
+  popup.id = "settingTooltip"; popup.className = "setting-tooltip";
+  popup.setAttribute("role", "tooltip"); popup.hidden = true;
+  document.body.append(popup);
+  let active = null;
+  function hide() {
+    if (active) {
+      const ids = (active.getAttribute("aria-describedby") || "").split(" ").filter(id => id && id !== popup.id);
+      if (ids.length) active.setAttribute("aria-describedby", ids.join(" ")); else active.removeAttribute("aria-describedby");
+    }
+    active = null; popup.hidden = true;
+  }
+  function show(node) {
+    if (!node || !node.dataset.help) { hide(); return; }
+    hide(); active = node; popup.textContent = node.dataset.help; popup.hidden = false;
+    node.setAttribute("aria-describedby", [node.getAttribute("aria-describedby"), popup.id].filter(Boolean).join(" "));
+    const rect = node.getBoundingClientRect(), box = popup.getBoundingClientRect();
+    popup.style.left = Math.max(10, Math.min(innerWidth - box.width - 10, rect.left + rect.width / 2 - box.width / 2)) + "px";
+    popup.style.top = Math.max(10, rect.bottom + box.height + 12 < innerHeight ? rect.bottom + 8 : rect.top - box.height - 8) + "px";
+  }
+  document.addEventListener("pointerover", event => show(event.target.closest?.("[data-help]")));
+  document.addEventListener("pointerout", event => {
+    if (active && (!(event.relatedTarget instanceof Node) || !active.contains(event.relatedTarget))) hide();
+  });
+  document.addEventListener("focusin", event => show(event.target.closest?.("[data-help]")));
+  document.addEventListener("focusout", hide);
+  document.addEventListener("scroll", hide, true);
+  window.addEventListener("resize", hide);
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !popup.hidden) { hide(); event.stopPropagation(); }
+  }, true);
+  root.EditorTooltips = {
+    set(node, text, includeLabel = false) {
+      if (!node) return;
+      node.dataset.help = text; node.removeAttribute("title");
+      const label = includeLabel && (node.closest("label") || node.closest(".brush-size-row") || node.closest(".brush-controls"));
+      if (label) { label.dataset.help = text; label.removeAttribute("title"); }
+      if (active === node || active === label) show(active);
+    },
+  };
+})(globalThis);
+
+/* ==================== BACKGROUND ==================== */
+// 2. Background removal engine and local Blob Worker
+/* Local, dependency-free image processing. This factory also runs in a Blob Worker. */
+(function (root) {
+  "use strict";
+  function createEngine() {
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    let disposed = false;
+    const pause = async () => {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (disposed) throw new Error("Cancelled");
+    };
+    const linear = Float32Array.from({ length: 256 }, (_, v) => {
+      v /= 255;
+      return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    });
+    const srgb = v => 255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055);
+    function rgbToLab(r, g, b) {
+      r = linear[r]; g = linear[g]; b = linear[b];
+      const f = v => v > 216 / 24389 ? Math.cbrt(v) : (24389 / 27 * v + 16) / 116;
+      const x = f((0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047);
+      const y = f(0.2126729 * r + 0.7151522 * g + 0.072175 * b);
+      const z = f((0.0193339 * r + 0.119192 * g + 0.9503041 * b) / 1.08883);
+      return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+    }
+    let w, h, n, rgba, lab, gradient, percentile, mask, groups, stats, barrierKey, barrier;
+    const opaque = i => rgba[i * 4 + 3] > 8;
+    const delta = (i, j) => Math.hypot(lab[i * 3] - lab[j * 3], lab[i * 3 + 1] - lab[j * 3 + 1], lab[i * 3 + 2] - lab[j * 3 + 2]) / 128;
+    const fromModel = (i, m) => Math.hypot(lab[i * 3] / 128 - m.lab[0], lab[i * 3 + 1] / 128 - m.lab[1], lab[i * 3 + 2] / 128 - m.lab[2]);
+    const median = a => a.sort((a, b) => a - b)[a.length >> 1];
+
+    async function prepare(image) {
+      w = image.width; h = image.height; n = w * h;
+      if (!w || !h || image.data.length !== n * 4) throw new Error("Invalid image");
+      rgba = new Uint8ClampedArray(image.data);
+      // Fixed-point LAB saves half the memory of three full-resolution float maps.
+      lab = new Int16Array(n * 3);
+      gradient = new Uint8Array(n);
+      mask = null; barrier = null; barrierKey = null;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x, p = i * 4;
+          const c = rgbToLab(rgba[p], rgba[p + 1], rgba[p + 2]);
+          for (let k = 0; k < 3; k++) lab[i * 3 + k] = Math.round(c[k] * 128);
+        }
+        if (y % 64 === 0) await pause();
+      }
+      // Three rolling Gaussian-blurred LAB rows: no second full-size float image.
+      const rows = [new Float32Array(w * 3), new Float32Array(w * 3), new Float32Array(w * 3)];
+      function blurRow(y, out) {
+        y = clamp(y, 0, h - 1);
+        for (let x = 0; x < w; x++) {
+          const center = y * w + x;
+          for (let c = 0; c < 3; c++) {
+            let sum = 0, weight = 0;
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+              const i = clamp(y + dy, 0, h - 1) * w + clamp(x + dx, 0, w - 1);
+              const a = (dx === 0 ? 2 : 1) * (dy === 0 ? 2 : 1);
+              // Invisible RGB must not create false contours.
+              sum += lab[(opaque(i) ? i : center) * 3 + c] * a;
+              weight += a;
+            }
+            out[x * 3 + c] = sum / (weight * 128);
+          }
+        }
+      }
+      blurRow(-1, rows[0]); blurRow(0, rows[1]); blurRow(1, rows[2]);
+      const histogram = new Uint32Array(256);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x;
+          if (!opaque(i)) continue;
+          let power = 0;
+          for (let c = 0; c < 3; c++) {
+            const l = Math.max(0, x - 1) * 3 + c, m = x * 3 + c, r = Math.min(w - 1, x + 1) * 3 + c;
+            const gx = rows[0][r] + 2 * rows[1][r] + rows[2][r] - rows[0][l] - 2 * rows[1][l] - rows[2][l];
+            const gy = rows[2][l] + 2 * rows[2][m] + rows[2][r] - rows[0][l] - 2 * rows[0][m] - rows[0][r];
+            power += (gx * gx + gy * gy) * (c === 0 ? 1 : 0.55);
+          }
+          gradient[i] = Math.min(255, Math.round(Math.sqrt(power) / 4 * 3));
+          if (gradient[i] > 2) histogram[gradient[i]]++;
+        }
+        const first = rows.shift(); rows.push(first); blurRow(y + 2, first);
+        if (y % 64 === 0) await pause();
+      }
+      const total = histogram.reduce((a, b) => a + b, 0);
+      let acc = 0; percentile = 20;
+      for (let i = 3; i < 256; i++) {
+        acc += histogram[i];
+        if (acc >= total * 0.85) { percentile = i; break; }
+      }
+      return { width: w, height: h };
+    }
+
+    function backgroundAt(i) {
+      const channels = [[], [], []], x = i % w, y = Math.floor(i / w);
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const j = clamp(y + dy, 0, h - 1) * w + clamp(x + dx, 0, w - 1);
+        if (!opaque(j)) continue;
+        for (let c = 0; c < 3; c++) channels[c].push(rgba[j * 4 + c]);
+      }
+      const rgb = channels.map((a, c) => a.length ? median(a) : rgba[i * 4 + c]);
+      const model = { rgb, lab: rgbToLab(...rgb), seeds: [i], transparent: !opaque(i) && !channels[0].length };
+      const distances = [];
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const j = clamp(y + dy, 0, h - 1) * w + clamp(x + dx, 0, w - 1);
+        if (opaque(j)) distances.push(fromModel(j, model));
+      }
+      model.noise = distances.length ? median(distances) : 0;
+      return model;
+    }
+
+    async function morph(input, radius, dilate) {
+      const tmp = new Uint8Array(n), out = new Uint8Array(n);
+      for (let axis = 0; axis < 2; axis++) {
+        const src = axis ? tmp : input, dst = axis ? out : tmp;
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            let v = dilate ? 0 : 1;
+            for (let k = -radius; k <= radius; k++) {
+              const j = axis ? clamp(y + k, 0, h - 1) * w + x : y * w + clamp(x + k, 0, w - 1);
+              if (dilate ? src[j] : !src[j]) { v = dilate ? 1 : 0; break; }
+            }
+            dst[y * w + x] = v;
+          }
+          if (y % 128 === 0) await pause();
+        }
+      }
+      return out;
+    }
+
+    async function buildBarrier(options) {
+      const key = `${options.edge}:${options.closing}`;
+      if (barrierKey === key) return;
+      barrierKey = key;
+      barrier = new Uint8Array(n);
+      if (options.edge === 0) return;
+      const threshold = Math.max(6, percentile * (1.7 - options.edge * 0.014));
+      for (let i = 0; i < n; i++) barrier[i] = gradient[i] >= threshold ? 1 : 0;
+      if (options.closing) {
+        const closed = await morph(await morph(barrier, options.closing, true), options.closing, false);
+        for (let i = 0; i < n; i++) barrier[i] |= closed[i];
+      }
+    }
+
+    function borderSeeds() {
+      const clusters = [];
+      const step = Math.max(1, Math.floor(2 * (w + h) / 256));
+      const points = [];
+      for (let x = 0; x < w; x += step) points.push(x, (h - 1) * w + x);
+      for (let y = 0; y < h; y += step) points.push(y * w, y * w + w - 1);
+      for (const i of points) {
+        if (!opaque(i) || barrier[i] || gradient[i] > 8) continue;
+        const model = backgroundAt(i);
+        if (fromModel(i, model) > 4) continue;
+        let group = clusters.find(m => Math.hypot(...m.lab.map((v, c) => v - model.lab[c])) < 7);
+        if (!group) { group = model; clusters.push(group); } else group.seeds.push(i);
+      }
+      clusters.sort((a, b) => b.seeds.length - a.seeds.length);
+      const best = clusters[0];
+      // Require repeated, smooth, similarly colored border samples; never seed every edge pixel.
+      return best && best.seeds.length >= Math.max(3, points.length * 0.18) ? [best] : [];
+    }
+
+    function radialGuard(seed, model, tolerance) {
+      const cx = seed % w, cy = Math.floor(seed / w), rays = 360;
+      const radii = new Float32Array(rays); let found = 0;
+      for (let a = 0; a < rays; a++) {
+        const angle = a * Math.PI * 2 / rays, dx = Math.cos(angle), dy = Math.sin(angle);
+        let run = 0;
+        for (let r = 3; r < Math.hypot(w, h); r++) {
+          const x = Math.round(cx + r * dx), y = Math.round(cy + r * dy);
+          if (x < 0 || y < 0 || x >= w || y >= h) break;
+          const i = y * w + x;
+          if (opaque(i) && fromModel(i, model) > tolerance) run++; else run = 0;
+          if (run >= 2) { radii[a] = r - 1; found++; break; }
+        }
+      }
+      if (found < rays * 0.75) return null;
+      for (let a = 0; a < rays; a++) if (!radii[a]) {
+        for (let d = 1; d < rays; d++) {
+          const left = radii[(a - d + rays) % rays], right = radii[(a + d) % rays];
+          if (left && right) { radii[a] = (left + right) / 2; break; }
+        }
+      }
+      const smooth = Float32Array.from(radii, (_, a) => median([-2, -1, 0, 1, 2].map(d => radii[(a + d + rays) % rays])));
+      return i => {
+        const dx = i % w - cx, dy = Math.floor(i / w) - cy;
+        const a = (Math.atan2(dy, dx) / (2 * Math.PI) * rays + rays) % rays;
+        const k = Math.floor(a), r = smooth[k] * (1 - (a - k)) + smooth[(k + 1) % rays] * (a - k);
+        return dx * dx + dy * dy <= r * r;
+      };
+    }
+
+    // Locate a coherent annular band using background-relative contrast, rather
+    // than the strongest highlights in the image. Dark steel can be only a few
+    // LAB units away from a black background. Polar support across many angles
+    // distinguishes the band from isolated smudges, screws and dust.
+    function detectFrameStructure(model) {
+      const cx = (w - 1) / 2, cy = (h - 1) / 2, size = Math.min(w, h);
+      const rays = 720, step = Math.max(1, size / 1024), bins = Math.ceil(Math.hypot(w, h) / (2 * step)) + 2;
+      const signal = new Uint8Array(rays * bins), coverage = new Float32Array(bins);
+      const limits = new Uint16Array(rays);
+      const threshold = clamp(1.2 + (model.noise || 0) * 2.5, 1.5, 8);
+      for (let a = 0; a < rays; a++) {
+        const angle = a * 2 * Math.PI / rays, dx = Math.cos(angle), dy = Math.sin(angle);
+        for (let r = 0; r < bins; r++) {
+          const x = Math.round(cx + r * step * dx), y = Math.round(cy + r * step * dy);
+          if (x < 0 || y < 0 || x >= w || y >= h) break;
+          limits[a] = r;
+          const i = y * w + x;
+          if (opaque(i) && fromModel(i, model) > threshold) {
+            signal[a * bins + r] = 1; coverage[r]++;
+          }
+        }
+      }
+      const half = Math.max(1, Math.round(size * 0.008 / step));
+      let peak = 0, best = 0;
+      for (let r = Math.ceil(size * 0.12 / step); r < Math.min(bins - half, size * 0.56 / step); r++) {
+        let score = 0;
+        for (let d = -half; d <= half; d++) score += coverage[Math.max(0, r + d)];
+        score /= (half * 2 + 1) * rays;
+        if (score > best) { best = score; peak = r; }
+      }
+      if (best < 0.62) return null;
+      const inner = new Float32Array(rays), outer = new Float32Array(rays);
+      const gap = Math.max(2, Math.round(size * 0.012 / step));
+      let valid = 0;
+      for (let a = 0; a < rays; a++) {
+        const runs = [];
+        let start = -1, last = -1, hits = 0;
+        for (let r = Math.ceil(size * 0.08 / step); r <= limits[a]; r++) {
+          if (signal[a * bins + r]) {
+            if (start < 0) start = r;
+            last = r; hits++;
+          }
+          if (start >= 0 && (r - last > gap || r === limits[a])) {
+            if (hits >= 2) runs.push({ start, end: last });
+            start = -1; hits = 0;
+          }
+        }
+        let anchor = -1, distance = Infinity;
+        runs.forEach((run, index) => {
+          const d = Math.max(run.start - peak, peak - run.end, 0);
+          if (d < distance) { distance = d; anchor = index; }
+        });
+        if (anchor < 0 || distance * step > size * 0.065) continue;
+        let first = anchor, lastRun = anchor;
+        // Small dark seams do not split the frame; larger empty gaps still do.
+        while (first > 0 && (runs[first].start - runs[first - 1].end) * step < size * 0.035) first--;
+        while (lastRun + 1 < runs.length && (runs[lastRun + 1].start - runs[lastRun].end) * step < size * 0.12) lastRun++;
+        inner[a] = Math.max(1, runs[first].start * step - 1);
+        outer[a] = runs[lastRun].end * step + 1;
+        valid++;
+      }
+      if (valid < rays * 0.78) return null;
+      for (let a = 0; a < rays; a++) if (!inner[a]) {
+        let left = 1, right = 1;
+        while (left < rays && !inner[(a - left + rays) % rays]) left++;
+        while (right < rays && !inner[(a + right) % rays]) right++;
+        if (left + right > 40) return null;
+        for (const radii of [inner, outer]) radii[a] = (radii[(a - left + rays) % rays] * right + radii[(a + right) % rays] * left) / (left + right);
+      }
+      // Reject single-ray debris while retaining broad spikes and local recesses.
+      const smooth = radii => Float32Array.from(radii, (_, a) => median([-1, 0, 1].map(d => radii[(a + d + rays) % rays])));
+      const inside = smooth(inner), outside = smooth(outer);
+      const typicalWidth = median(Array.from(inside, (r, a) => outside[a] - r));
+      const coherent = inside.slice();
+      for (let a = 0; a < rays; a++) {
+        const neighbors = [];
+        for (let d = -36; d <= 36; d++) neighbors.push(inside[(a + d + rays) % rays]);
+        neighbors.sort((a, b) => a - b);
+        const supported = neighbors[Math.floor(neighbors.length * 0.25)];
+        // A black seam can make the first visible material appear much farther
+        // out, producing a suddenly thin band. Continue the neighboring inner
+        // contour across that ambiguity instead of treating steel as background.
+        if (outside[a] - inside[a] < typicalWidth * 0.95 && inside[a] - supported > Math.max(3, typicalWidth * 0.25)) coherent[a] = supported + Math.max(1, typicalWidth * 0.08);
+      }
+      inside.set(coherent);
+      const innerMedian = median(Array.from(inside)), outerMedian = median(Array.from(outside));
+      if (innerMedian < size * 0.12 || outerMedian - innerMedian < size * 0.015 || outerMedian - innerMedian > size * 0.32) return null;
+      return {
+        allows(i, mode) {
+          const dx = i % w - cx, dy = Math.floor(i / w) - cy;
+          const angle = (Math.atan2(dy, dx) * rays / (2 * Math.PI) + rays) % rays;
+          const a = Math.floor(angle), t = angle - a, radii = mode === "inside" ? inside : outside;
+          const r = radii[a] * (1 - t) + radii[(a + 1) % rays] * t, squared = dx * dx + dy * dy;
+          return mode === "inside" ? squared < r * r : squared > r * r;
+        },
+        confidence: best,
+      };
+    }
+
+    async function select(options) {
+      await buildBarrier(options);
+      groups = [];
+      for (const point of options.seeds) {
+        const x = clamp(Math.floor(point.x), 0, w - 1), y = clamp(Math.floor(point.y), 0, h - 1);
+        const model = backgroundAt(y * w + x);
+        const group = groups.find(m => m.transparent === model.transparent && Math.hypot(...m.lab.map((v, c) => v - model.lab[c])) < 5);
+        if (group) group.seeds.push(y * w + x); else groups.push(model);
+      }
+      if (options.auto && options.mode === "outside") groups.push(...borderSeeds());
+      mask = new Uint8Array(n);
+      const queue = new Uint32Array(n), allowed = new Uint8Array(n);
+      const tolerance = 1.5 + options.color * 0.75, local = 1.5 + options.local * 0.35;
+      const structureMode = options.structure || "auto", centerModel = backgroundAt(Math.floor(h / 2) * w + Math.floor(w / 2));
+      const structureModel = options.mode === "outside" || centerModel.transparent ? groups.find(group => !group.transparent) || centerModel : centerModel;
+      const darkBackground = structureModel.lab[0] < 22;
+      const useStructure = options.protectEnclosure !== false && !structureModel.transparent && (structureMode === "ring" || (structureMode === "auto" && darkBackground));
+      const structure = useStructure ? detectFrameStructure(structureModel) : null;
+      let radialFailed = false;
+      for (const group of groups) {
+        allowed.fill(0);
+        const guard = !structure && options.radial && options.mode === "inside" ? radialGuard(group.seeds[0], group, tolerance) : null;
+        if (!structure && options.radial && options.mode === "inside" && !guard) radialFailed = true;
+        const groupTolerance = !structure && structureMode !== "color" && group.lab[0] < 22 && !group.transparent
+          ? Math.min(tolerance, Math.max(3, 1.5 + group.noise * 2 + options.color * 0.12)) : tolerance;
+        let head = 0, tail = 0;
+        for (const i of group.seeds) {
+          if (!mask[i] && !barrier[i] && (!guard || guard(i)) && (!structure || structure.allows(i, options.mode))) {
+            mask[i] = 1; queue[tail++] = i;
+          }
+        }
+        function visit(j, i) {
+          if (mask[j] || barrier[j] || (guard && !guard(j)) || (structure && !structure.allows(j, options.mode))) return;
+          if (!allowed[j]) allowed[j] = !opaque(j) || (!group.transparent && fromModel(j, group) <= groupTolerance) ? 1 : 2;
+          if (allowed[j] === 2 || (opaque(j) && opaque(i) && delta(i, j) > local)) return;
+          mask[j] = 1; queue[tail++] = j;
+        }
+        while (head < tail) {
+          const i = queue[head++], x = i % w;
+          if (x > 0) visit(i - 1, i);
+          if (x < w - 1) visit(i + 1, i);
+          if (i >= w) visit(i - w, i);
+          if (i < n - w) visit(i + w, i);
+          if (head % 131072 === 0) await pause();
+        }
+      }
+      let count = 0, visible = 0, touchesBorder = false;
+      for (let i = 0; i < n; i++) {
+        if (opaque(i)) { visible++; if (mask[i]) count++; }
+        if (mask[i] && (i < w || i >= n - w || i % w === 0 || i % w === w - 1)) touchesBorder = true;
+      }
+      const center = Math.floor(h / 2) * w + Math.floor(w / 2);
+      const warnings = [];
+      // A portrait background may legitimately cover its center and image borders.
+      // Enclosure warnings protect decorative frames, while the large-area guard
+      // remains active for every image.
+      if (options.protectEnclosure !== false) {
+        if (count && options.mode === "inside" && touchesBorder) warnings.push("leak");
+        if (count && options.mode === "outside" && mask[center]) warnings.push("center");
+      }
+      if (count > visible * 0.92) warnings.push("large");
+      if (radialFailed) warnings.push("radial");
+      if (useStructure && !structure) warnings.push("structure");
+      if (!count && (groups.some(group => group.transparent) || (options.auto && !groups.length && [0, w - 1, n - w, n - 1].every(i => !opaque(i))))) warnings.push("transparent");
+      stats = { count, fraction: count / Math.max(visible, 1), warnings, structureUsed: Boolean(structure) };
+      return stats;
+    }
+
+    async function distanceTo(selected) {
+      const d = new Uint8Array(n); d.fill(255);
+      for (let i = 0; i < n; i++) if (Boolean(mask[i]) === selected) d[i] = 0;
+      // Chamfer distance (3/4 weights), capped naturally by Uint8 storage.
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x;
+          let v = d[i];
+          if (x) v = Math.min(v, d[i - 1] + 3);
+          if (y) {
+            v = Math.min(v, d[i - w] + 3);
+            if (x) v = Math.min(v, d[i - w - 1] + 4);
+            if (x < w - 1) v = Math.min(v, d[i - w + 1] + 4);
+          }
+          d[i] = v;
+        }
+        if (y % 128 === 0) await pause();
+      }
+      for (let y = h - 1; y >= 0; y--) {
+        for (let x = w - 1; x >= 0; x--) {
+          const i = y * w + x;
+          let v = d[i];
+          if (x < w - 1) v = Math.min(v, d[i + 1] + 3);
+          if (y < h - 1) {
+            v = Math.min(v, d[i + w] + 3);
+            if (x) v = Math.min(v, d[i + w - 1] + 4);
+            if (x < w - 1) v = Math.min(v, d[i + w + 1] + 4);
+          }
+          d[i] = v;
+        }
+        if (y % 128 === 0) await pause();
+      }
+      return d;
+    }
+
+    async function refine(options) {
+      if (!mask) throw new Error("Select an area first");
+      const out = new Uint8ClampedArray(rgba);
+      const band = Math.max(options.feather + 1, options.halo ? 4 : 0);
+      const distance = band ? await distanceTo(true) : null;
+      const shadowDistance = options.shadows ? await distanceTo(false) : null;
+      const directions = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]];
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x, p = i * 4;
+          if (!rgba[p + 3]) continue;
+          if (mask[i]) {
+            out[p + 3] = 0;
+            if (options.shadows && shadowDistance[i] <= 18 && groups.length) {
+              const bg = groups.reduce((a, b) => fromModel(i, a) < fromModel(i, b) ? a : b).rgb;
+              const rgb = [rgba[p], rgba[p + 1], rgba[p + 2]];
+              const loss = bg.map((v, c) => (v - rgb[c]) / Math.max(32, v));
+              const strength = Math.max(0, Math.min(...loss));
+              if (strength > 0.015 && strength < 0.45 && Math.max(...loss) - strength < 0.08) {
+                out[p] = out[p + 1] = out[p + 2] = 0;
+                out[p + 3] = rgba[p + 3] * strength;
+              }
+            }
+            continue;
+          }
+          if (!band || distance[i] > band * 3) continue;
+          const d = distance[i] / 3;
+          let alpha = options.feather ? 1 - 0.5 * Math.max(0, 1 - d / (options.feather + 1)) : 1;
+          if (options.halo) {
+            let bgIndex = -1, fgIndex = -1;
+            for (let r = 1; r <= band + 3 && (bgIndex < 0 || fgIndex < 0); r++) {
+              for (const [dx, dy] of directions) {
+                const nx = x + dx * r, ny = y + dy * r;
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                const j = ny * w + nx;
+                if (!opaque(j)) continue;
+                if (bgIndex < 0 && mask[j]) bgIndex = j;
+                if (fgIndex < 0 && !mask[j] && distance[j] >= (band + 1) * 3) fgIndex = j;
+              }
+            }
+            if (bgIndex >= 0 && fgIndex >= 0) {
+              // Near black, linear RGB compresses all useful contrast below the
+              // old absolute stability cutoff. Use encoded RGB there and compare
+              // the residual relative to the actual foreground/background span.
+              const encoded = Math.max(...[0, 1, 2].map(c => rgba[fgIndex * 4 + c]), ...[0, 1, 2].map(c => rgba[bgIndex * 4 + c])) < 100;
+              const component = v => encoded ? v / 255 : linear[v];
+              const bg = [0, 1, 2].map(c => component(rgba[bgIndex * 4 + c]));
+              const fg = [0, 1, 2].map(c => component(rgba[fgIndex * 4 + c]));
+              const color = [0, 1, 2].map(c => component(rgba[p + c]));
+              let norm = 0, dot = 0;
+              for (let c = 0; c < 3; c++) { norm += (fg[c] - bg[c]) ** 2; dot += (color[c] - bg[c]) * (fg[c] - bg[c]); }
+              const a = clamp(dot / Math.max(norm, 1e-9), 0, 1);
+              const residual = color.reduce((sum, v, c) => sum + (v - (a * fg[c] + (1 - a) * bg[c])) ** 2, 0);
+              // Near-identical colors or an unrelated ornament are mathematically ambiguous.
+              if (norm > (encoded ? 0.0025 : 0.012) && residual < (encoded ? norm * 0.025 + 0.00003 : 0.018) && a < 0.98) {
+                if (options.shadows && Math.max(...color) - Math.min(...color) < 0.025) alpha = Math.max(alpha, a);
+                else {
+                  alpha = Math.min(alpha, a);
+                  for (let c = 0; c < 3; c++) {
+                    const corrected = clamp((color[c] - (1 - a) * bg[c]) / Math.max(a, 0.04), 0, 1);
+                    out[p + c] = encoded ? corrected * 255 : srgb(corrected);
+                  }
+                }
+              }
+            }
+          }
+          out[p + 3] = rgba[p + 3] * alpha;
+        }
+        if (y % 64 === 0) await pause();
+      }
+      return { data: out, selection: mask.slice(), ...stats };
+    }
+    return { prepare, select, refine, rgbToLab, dispose: () => { disposed = true; } };
+  }
+
+  function workerMain() {
+    const engine = createEngine();
+    self.onmessage = async ({ data: { id, method, value } }) => {
+      try {
+        const result = await engine[method](value);
+        const transfer = result.data ? [result.data.buffer, result.selection.buffer] : [];
+        self.postMessage({ id, result }, transfer);
+      } catch (error) { self.postMessage({ id, error: error.message }); }
+    };
+  }
+
+  function createProcessor() {
+    let worker = null, nextId = 0;
+    const pending = new Map(), fallback = createEngine();
+    try {
+      const url = URL.createObjectURL(new Blob([`${createEngine.toString()}\n(${workerMain.toString()})();`], { type: "text/javascript" }));
+      try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+    } catch (_) { /* Restrictive browsers use the same chunked algorithm on the main thread. */ }
+    if (worker) {
+      worker.onmessage = ({ data }) => {
+        const job = pending.get(data.id);
+        if (!job) return;
+        pending.delete(data.id);
+        if (data.error) job.reject(new Error(data.error)); else job.resolve(data.result);
+      };
+      worker.onerror = event => {
+        event.preventDefault();
+        for (const job of pending.values()) job.reject(new Error(event.message || "Worker failed"));
+        pending.clear();
+      };
+    }
+    return {
+      call(method, value) {
+        if (!worker) return fallback[method](value);
+        return new Promise((resolve, reject) => {
+          const id = ++nextId;
+          pending.set(id, { resolve, reject });
+          worker.postMessage({ id, method, value }, method === "prepare" ? [value.data.buffer] : []);
+        });
+      },
+      dispose() {
+        if (worker) worker.terminate();
+        fallback.dispose();
+        for (const job of pending.values()) job.reject(new Error("Cancelled"));
+        pending.clear();
+      },
+    };
+  }
+  function findEnclosedRegion(passable, width, height, seed) {
+    const mask = new Uint8Array(width * height);
+    if (!seed) return mask;
+    const queue = new Uint32Array(mask.length);
+    let head = 0, tail = 1;
+    queue[0] = seed.y * width + seed.x; mask[queue[0]] = 1;
+    function visit(i) { if (passable[i] && !mask[i]) { mask[i] = 1; queue[tail++] = i; } }
+    while (head < tail) {
+      const i = queue[head++], x = i % width;
+      // An unbounded outside region must never become the portrait window.
+      if (!x || x === width - 1 || i < width || i >= mask.length - width) { mask.fill(0); return mask; }
+      visit(i - 1); visit(i + 1); visit(i - width); visit(i + width);
+    }
+    return mask;
+  }
+  root.SmartBackgroundRemoval = { createEngine, createProcessor, findEnclosedRegion };
+})(typeof globalThis === "object" ? globalThis : this);
+
+/* ==================== SMART_UI ==================== */
+// 3. Smart-removal panel controllers
+/* Shared side-panel adapter. Each instance owns its settings and non-destructive preview. */
+(function (root) {
+  "use strict";
+  const TEXT = {
+    ru: {
+      title: "Умное удаление фона", mode: "Область удаления", inside: "Внутри рамки", outside: "Снаружи рамки",
+      hint: "Нажмите на фон рамки. Shift + клик добавляет область, ПКМ убирает ближайшую точку. Средняя кнопка — перемещение, колесо — масштаб.",
+      color: "Допуск цвета", edge: "Защита контуров", feather: "Смягчение края, px", halo: "Убрать цвет фона с края", shadows: "Сохранить мягкие тени",
+      advanced: "Дополнительно", local: "Локальный допуск", closing: "Закрытие разрывов, px",
+      auto: "Найти внешний фон", clear: "Сбросить точки", view: "Предпросмотр", highlight: "Подсветка удаления", transparency: "Прозрачность",
+      apply: "Применить", reset: "Сбросить всю категорию", download: "PNG рамки",
+      findInside: "Найти внутренний фон", defaults: "Восстановить значения по умолчанию", selectionActions: "Выбор фоновой области",
+      applied: "Изменения применены. Выберите следующую область; настройки сохранены.",
+      structureLabel: "Анализ рамки", structureAuto: "Авто: цвет и форма", structureColor: "Только цвет и границы", structureRing: "Форма кольца",
+      radialLabel: "Дополнительная радиальная защита",
+      structure: "Надёжная форма кольца не найдена. Использовано осторожное выделение по цвету; проверьте результат.",
+      transparent: "В точке уже есть прозрачность. Она не используется как образец чёрного цвета; выберите видимый фон.",
+      structureUsed: "Тёмные детали защищены формой рамки.",
+      ready: "Выберите фон на изображении рамки.", busy: "Обработка… Можно изменить настройки или отменить.",
+      selected: "Выбрано: {percent}% видимых пикселей. Точек: {seeds}.", empty: "Подходящая область не найдена. Выберите другую точку или измените настройки.",
+      leak: "Область достигла края изображения: возможно протекание через разрыв рамки.", center: "Внешнее выделение попало в центр: проверьте, что внутренняя область не захвачена.",
+      large: "Выделено почти всё изображение. Проверьте результат перед применением.", radial: "Замкнутый радиальный контур не найден. Использовано обычное выделение.",
+      acknowledge: "Я проверил выделение и хочу применить его", error: "Не удалось обработать рамку. Изображение сохранено; попробуйте снова.",
+      open: "Открыть файл", points: "Точка фона",
+    },
+    en: {
+      title: "Smart Background Removal", mode: "Removal mode", inside: "Remove Inside", outside: "Remove Outside",
+      hint: "Click the frame background. Shift + click adds a region; right-click removes the nearest seed. Middle button pans; wheel zooms.",
+      color: "Color Tolerance", edge: "Edge Protection", feather: "Edge Feathering, px", halo: "Remove Edge Background Color", shadows: "Preserve Soft Shadows",
+      advanced: "Advanced", local: "Local Color Tolerance", closing: "Close contour gaps, px",
+      auto: "Find Outside Background", clear: "Clear Seeds", view: "Preview", highlight: "Highlight Removal", transparency: "Transparency",
+      apply: "Apply", reset: "Reset Entire Category", download: "Frame PNG",
+      findInside: "Find Inside Background", defaults: "Restore Default Values", selectionActions: "Background Selection",
+      applied: "Changes applied. Choose the next region; your settings are preserved.",
+      structureLabel: "Frame Analysis", structureAuto: "Auto: Color and Shape", structureColor: "Color and Edges Only", structureRing: "Ring Shape",
+      radialLabel: "Additional Radial Protection",
+      structure: "No reliable ring shape found. Using conservative color selection; check the result.",
+      transparent: "This seed is already transparent. Its hidden RGB is not treated as black background; select visible background.",
+      structureUsed: "Dark details are protected by the frame shape.",
+      ready: "Choose a background area in the frame image.", busy: "Processing… You can change settings or cancel.",
+      selected: "Selected: {percent}% of visible pixels. Seeds: {seeds}.", empty: "No suitable region found. Choose another point or adjust settings.",
+      leak: "The region reached the image border: it may have leaked through a contour gap.", center: "The outside selection reached the center. Check that the inner region is preserved.",
+      large: "Almost the entire image is selected. Check the preview before applying.", radial: "No reliable closed radial contour found. Using region growing.",
+      acknowledge: "I checked the selection and want to apply it", error: "Frame processing failed. Your image is unchanged; please try again.",
+      open: "Open File", points: "Background seed",
+    },
+  };
+  const TOKEN_TEXT = {
+    ru: {
+      inside: "Область по клику", outside: "Внешний фон", download: "PNG изображения",
+      structureLabel: "Анализ изображения", structureAuto: "Авто: цвет и границы",
+      hint: "Нажмите на фон изображения. Shift + клик добавляет область, ПКМ убирает ближайшую точку. Средняя кнопка — перемещение, колесо — масштаб.",
+      ready: "Выберите фон на изображении.", error: "Не удалось обработать изображение. Изменения не применены; попробуйте снова.",
+    },
+    en: {
+      inside: "Clicked Region", outside: "Outside Background", download: "Image PNG",
+      structureLabel: "Image Analysis", structureAuto: "Auto: Color and Edges",
+      hint: "Click the image background. Shift + click adds a region; right-click removes the nearest seed. Middle button pans; wheel zooms.",
+      ready: "Choose a background area in the image.", error: "Image processing failed. Changes were not applied; please try again.",
+    },
+  };
+  const TIPS = {
+    ru: {
+      open: "Раскрывает настройки умного удаления. Снятие чекбокса отменяет только текущий предпросмотр, уже применённые правки сохраняются.",
+      mode: "Выбирает область удаления. Внутри рамки — отверстие в центре, снаружи — фон вокруг неё. На изображении можно выбрать любую связную область по клику.",
+      structure: "Авто защищает форму тёмного кольца, если контур достаточно надёжен. Только цвет подходит для произвольных изображений. Форма кольца принудительно ищет внутренний и внешний контур; при неудаче появится предупреждение.",
+      color: "Насколько цвет фона может отличаться от образца в точке клика. Больше — удаляется больше оттенков и градиентов, но легче захватить похожие детали. Для чёрного фона начните с Авто и небольшого допуска.",
+      edge: "Чем выше значение, тем сложнее выделению пересечь цветовую границу. Слишком высокая защита может оставить кайму или разделить фон на участки. 0 отключает барьер Sobel.",
+      feather: "Ширина мягкого перехода в пикселях исходного изображения. 0 — чёткий край; увеличение смягчает узкую полосу и может истончить мелкие детали.",
+      halo: "Убирает примесь белого, чёрного или цветного фона с пограничных пикселей. Корректирует RGB вместе с прозрачностью. Не восстанавливает детали, цвет которых полностью совпал с фоном.",
+      shadows: "Пытается сохранить сероватые мягкие тени возле рамки на светлом фоне. Может оставить немного фона. Чёрную тень на чёрном фоне достоверно восстановить невозможно.",
+      local: "Допустимый скачок цвета между соседними пикселями при заливке. Меньше — осторожнее проходит границы; больше — легче проходит шум и плавные переходы. Общий допуск цвета всё равно ограничивает область.",
+      closing: "Закрывает небольшие разрывы карты контуров перед выделением. 0 — выключено. Больший радиус лучше закрывает щели, но может объединить тонкие детали и оставить фон рядом с ними.",
+      radial: "Запасная защита внутренней области по лучам из точки клика. Применяется, если основной контур формы не найден. Подходит для почти круглых и овальных отверстий; сложные вогнутости могут определяться неточно.",
+      view: "Подсветка показывает, что будет удалено. Прозрачность показывает будущий результат на шахматном фоне. Переключение не применяет правки.",
+      auto: "Заменяет текущее выделение похожими гладкими участками вдоль границ изображения как внешним фоном. Контрастные детали у края не считаются фоном автоматически. Всегда проверьте предпросмотр.",
+      findInside: "Переключает область удаления на внутреннюю и ставит одну точку точно в центре исходного изображения, как обычный клик. Предыдущие точки и автоматическое внешнее выделение заменяются.",
+      clear: "Удаляет только стартовые точки и автоматическое выделение текущего предпросмотра. Применённая очистка сохраняется.",
+      apply: "Применяет текущий предпросмотр к этой стороне. Панель остаётся открытой, настройки сохраняются, а точки очищаются для следующей операции. Положение, масштаб, другая сторона и ручные маски сохраняются.",
+      defaults: "Возвращает параметры обработки, область удаления и вид предпросмотра к начальным значениям. Применённые правки сохраняются. При смене области удаления точки сбрасываются; иначе выделение пересчитывается по прежним точкам.",
+      reset: "Сбрасывает всю умную очистку этой стороны и её предпросмотр. Правки обычных кистей, другая сторона и композиция сохраняются.",
+      download: "Сохраняет уже применённый результат этой стороны в PNG с прозрачностью и исходным разрешением. Текущий неприменённый предпросмотр в файл не входит.",
+      risk: "Разрешает применить подозрительное выделение после вашей проверки. Без отметки потенциально разрушительная операция заблокирована.",
+      advanced: "Дополнительные ограничения заливки и исправление небольших разрывов. Начинайте с основных настроек и меняйте эти параметры при необходимости.",
+    },
+    en: {
+      open: "Opens smart removal settings. Unchecking cancels only the current preview; previously applied changes remain.",
+      mode: "Chooses the region to remove: the frame opening or the surrounding background. On a portrait, a click can select any connected region.",
+      structure: "Auto protects a dark ring when its shape is reliable. Color Only suits arbitrary images. Ring Shape explicitly searches for inner and outer contours and warns if detection fails.",
+      color: "Maximum background color difference from the clicked sample. Higher values remove more shades and gradients but may include similar details. Start with Auto and low tolerance for black backgrounds.",
+      edge: "Higher values make detected color boundaries harder to cross. Excessive protection may leave a fringe or split the background. 0 disables the Sobel barrier.",
+      feather: "Soft transition width in original-image pixels. 0 gives a sharp edge; increasing it softens a narrow band and may thin fine details.",
+      halo: "Removes white, black or colored background contamination from edge pixels by adjusting RGB and alpha together. Cannot recover detail identical to its background.",
+      shadows: "Tries to retain soft gray shadows near a frame on light backgrounds. May leave some background. Black shadows on black backgrounds cannot be reliably recovered.",
+      local: "Maximum color jump between adjacent pixels during region growing. Lower values protect boundaries; higher values cross noise and gradients more easily. Global color tolerance still limits growth.",
+      closing: "Closes small gaps in detected contours. 0 disables it. A larger radius bridges gaps more strongly but may connect fine details and leave background nearby.",
+      radial: "Fallback inner protection using rays from the clicked point when the primary frame contour is unavailable. Best for nearly round or oval openings; deep concavities can be inaccurate.",
+      view: "Highlight shows what will be removed. Transparency previews the result on a checkerboard. Switching views never applies changes.",
+      auto: "Replaces the current selection with similar smooth image-border regions as outside background. Contrasting decorations touching an edge are not automatically treated as background. Check the preview.",
+      findInside: "Switches to the inner region and places one seed at the exact center of the original image, just like a normal click. Replaces previous seeds and automatic outside selection.",
+      clear: "Clears only the current seeds and automatic selection. Previously applied cleanup is preserved.",
+      apply: "Applies this preview to the selected side. The panel stays open, settings are preserved and seeds are cleared for the next operation. Placement, scale, the other side and manual masks remain unchanged.",
+      defaults: "Restores initial processing values, removal mode and preview style. Applied image edits remain unchanged. Seeds are cleared if the removal mode changes; otherwise the same seeds are recalculated.",
+      reset: "Resets all smart cleanup and its preview on this side. Manual brushes, the other side and composition remain unchanged.",
+      download: "Saves the applied result as a full-resolution PNG with transparency. An unapplied preview is not included.",
+      risk: "Allows a suspicious selection to be applied after you review it. Potentially destructive selection is blocked without this acknowledgement.",
+      advanced: "Additional growth limits and small-gap repair. Start with the main controls and adjust these only when needed.",
+    },
+  };
+
+  function create(api) {
+    const isToken = api.side === "token", prefix = isToken ? "tokenSmart" : "smart";
+    const container = document.querySelector(`[data-smart-side="${api.side}"]`);
+    const content = document.getElementById("smartRemovalTemplate").content.cloneNode(true);
+    // The same template supplies both panels, including correctly associated labels.
+    const scopedId = id => id.replace(/^smart/, prefix);
+    content.querySelectorAll("[id]").forEach(node => { node.id = scopedId(node.id); });
+    for (const attribute of ["for", "aria-controls"]) content.querySelectorAll(`[${attribute}]`).forEach(node => {
+      node.setAttribute(attribute, node.getAttribute(attribute).split(" ").map(scopedId).join(" "));
+    });
+    container.append(content);
+    const $ = id => document.getElementById(scopedId(id));
+    const panel = $("smartPanel"), open = $("smartOpen"), status = $("smartStatus");
+    const ids = ["mode", "structure", "color", "edge", "feather", "halo", "shadows", "local", "closing", "radial", "view"];
+    const inputs = Object.fromEntries(ids.map(k => [k, $("smart-" + k)]));
+    if (isToken) {
+      inputs.mode.value = "outside";
+      container.querySelectorAll("[data-smart-frame-only]").forEach(node => {
+        node.hidden = true;
+        if (node.tagName === "OPTION") node.disabled = true;
+      });
+    }
+    const readValue = input => input.type === "checkbox" ? input.checked : input.tagName === "SELECT" ? input.value : Number(input.value);
+    const defaultValues = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, readValue(input)]));
+    let language = "ru", session = null, timer;
+    let statusKey = "ready", statusVars = {}, warningKeys = [];
+    const tr = (key, vars = {}) => ((isToken && TOKEN_TEXT[language][key]) || TEXT[language][key] || key).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
+    const settings = () => Object.fromEntries(ids.filter(k => k !== "view").map(k => [k, readValue(inputs[k])]));
+    const tips = () => ({ ...TIPS[language], ...(isToken ? { structure: language === "ru"
+      ? "Авто использует цвет и границы и осторожнее обрабатывает тёмный фон. Только цвет и границы использует полный заданный допуск. Геометрия кольца применяется только к рамкам справа."
+      : "Auto uses color and edges with more conservative handling of dark backgrounds. Color and Edges Only uses the full selected tolerance. Ring geometry is available only for the frame on the right." } : {}) });
+    function message(key, vars = {}, warnings = []) {
+      statusKey = key; statusVars = vars; warningKeys = warnings;
+      status.textContent = [tr(key, vars), ...warnings.map(k => tr(k))].join(" ");
+      if (session?.result?.structureUsed) status.textContent += " " + tr("structureUsed");
+      status.classList.toggle("smart-warning", warnings.length > 0 || key === "error");
+    }
+    function updateButtons() {
+      const source = Boolean(api.getBase());
+      open.disabled = !source;
+      $("smartDownload").disabled = !source;
+      $("smartReset").disabled = !api.getSmartBase() && !session?.seeds.length && !session?.auto;
+      const risky = session?.result?.warnings.some(k => !["radial", "transparent"].includes(k));
+      $("smartRiskRow").hidden = !risky;
+      $("smartApply").disabled = !session?.result?.count || session.running || session.done !== session.version || (risky && !$("smartRisk").checked);
+    }
+    function setLanguage(lang) {
+      language = lang;
+      for (const scope of [container]) {
+        scope.querySelectorAll("[data-smart-text]").forEach(node => { node.textContent = tr(node.dataset.smartText); });
+        scope.querySelectorAll("[data-smart-label]").forEach(node => {
+          const label = tr(node.dataset.smartLabel);
+          node.setAttribute("aria-label", label);
+        });
+      }
+      $("smartDownload").setAttribute("aria-label", tr("download"));
+      $("smartSeedTools").setAttribute("aria-label", tr("selectionActions"));
+      for (const [key, input] of Object.entries(inputs)) EditorTooltips.set(input, tips()[key], true);
+      for (const [id, key] of Object.entries({ smartOpen: "open", smartAuto: "auto", smartInside: "findInside", smartClear: "clear", smartApply: "apply", smartReset: "reset", smartDefaults: "defaults", smartDownload: "download", smartRisk: "risk" })) {
+        const node = $(id), label = node.getAttribute("aria-label");
+        EditorTooltips.set(node, label ? label + ". " + tips()[key] : tips()[key], true);
+      }
+      EditorTooltips.set(container.querySelector("summary"), tips().advanced);
+      message(statusKey, statusVars, warningKeys);
+    }
+    function cancel() {
+      clearTimeout(timer);
+      if (session) session.processor.dispose();
+      session = null; panel.hidden = true;
+      open.checked = false;
+      open.setAttribute("aria-expanded", "false");
+      api.setActive(false); api.render(); updateButtons(); api.layout();
+    }
+    function reset() {
+      api.setBase(null); cancel(); updateButtons();
+    }
+    function resetEdits() {
+      const reopen = Boolean(session);
+      cancel(); api.setBase(null); api.changed();
+      if (reopen) begin();
+      updateButtons();
+    }
+    function restoreDefaults() {
+      const modeChanged = inputs.mode.value !== defaultValues.mode;
+      for (const [key, value] of Object.entries(defaultValues)) {
+        if (inputs[key].type === "checkbox") inputs[key].checked = value;
+        else inputs[key].value = String(value);
+        const output = $("smart-" + key + "-value");
+        if (output) output.value = String(value);
+      }
+      if (modeChanged && session) { session.seeds = []; session.auto = false; }
+      invalidate();
+    }
+    function createSession() {
+      return { base: api.getBase(), effective: api.getEffective(), seeds: [], auto: false, processor: SmartBackgroundRemoval.createProcessor(),
+        version: 0, done: -1, running: false, prepared: false, segmentKey: "", result: null, preview: null };
+    }
+    function begin() {
+      if (!api.getBase()) { open.checked = false; return; }
+      if (session) return;
+      api.disableBrush();
+      session = createSession();
+      panel.hidden = false; open.checked = true; open.setAttribute("aria-expanded", "true");
+      api.setActive(true); message("ready"); updateButtons(); api.render(); api.layout();
+    }
+    function invalidate(segment = true) {
+      if (!session) return;
+      session.version++;
+      if (segment) session.segmentKey = "";
+      session.result = null; session.preview = null;
+      $("smartRisk").checked = false;
+      clearTimeout(timer);
+      message(session.seeds.length || session.auto ? "busy" : "ready");
+      updateButtons(); api.render();
+      timer = setTimeout(run, 80);
+    }
+    async function run() {
+      const s = session;
+      if (!s || s.running || (!s.seeds.length && !s.auto)) return;
+      s.running = true; updateButtons();
+      try {
+        if (!s.prepared) {
+          const image = s.effective.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, s.effective.width, s.effective.height);
+          await s.processor.call("prepare", image);
+          s.prepared = true;
+        }
+        while (session === s && s.done !== s.version && (s.seeds.length || s.auto)) {
+          const version = s.version, options = { ...settings(), seeds: s.seeds.slice(), auto: s.auto, protectEnclosure: !isToken };
+          const key = JSON.stringify({ ...options, feather: 0, halo: false, shadows: false });
+          if (key !== s.segmentKey) { await s.processor.call("select", options); s.segmentKey = key; }
+          if (session !== s || version !== s.version) continue;
+          const result = await s.processor.call("refine", options);
+          if (session !== s || version !== s.version) continue;
+          s.result = result; s.done = version;
+          makePreview(s);
+          message(result.count ? "selected" : "empty", { percent: (result.fraction * 100).toFixed(1), seeds: s.seeds.length + (s.auto ? "+" : "") }, result.warnings);
+          api.render();
+        }
+      } catch (_) { if (session === s) { s.result = null; s.preview = null; message("error"); } }
+      finally { s.running = false; if (session === s) updateButtons(); }
+    }
+    function makePreview(s) {
+      if (!s.result) return;
+      const canvas = document.createElement("canvas"); canvas.width = s.effective.width; canvas.height = s.effective.height;
+      const ctx = canvas.getContext("2d");
+      if (inputs.view.value === "transparency") ctx.putImageData(new ImageData(s.result.data, canvas.width, canvas.height), 0, 0);
+      else {
+        ctx.drawImage(s.effective, 0, 0);
+        const overlay = ctx.createImageData(canvas.width, canvas.height);
+        for (let i = 0; i < s.result.selection.length; i++) if (s.result.selection[i]) {
+          overlay.data[i * 4] = 230; overlay.data[i * 4 + 1] = 56; overlay.data[i * 4 + 2] = 112; overlay.data[i * 4 + 3] = 120;
+        }
+        const tint = document.createElement("canvas"); tint.width = canvas.width; tint.height = canvas.height;
+        tint.getContext("2d").putImageData(overlay, 0, 0); ctx.drawImage(tint, 0, 0);
+      }
+      s.preview = canvas;
+    }
+    function select(point, remove, additive) {
+      if (!session) return;
+      const s = session;
+      if (remove) {
+        if (s.seeds.length) {
+          let nearest = 0, best = Infinity;
+          s.seeds.forEach((p, i) => { const d = (p.x - point.x) ** 2 + (p.y - point.y) ** 2; if (d < best) { best = d; nearest = i; } });
+          s.seeds.splice(nearest, 1);
+        }
+      } else {
+        if (!additive) { s.seeds = []; s.auto = false; }
+        if (s.seeds.length < 32) s.seeds.push(point);
+      }
+      invalidate();
+    }
+    function apply() {
+      const s = session;
+      if (!s?.result || $("smartApply").disabled) return;
+      try {
+        // Apply relative alpha to the base, preserving the three existing brush masks.
+        const canvas = document.createElement("canvas"); canvas.width = s.base.width; canvas.height = s.base.height;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true }); ctx.drawImage(s.base, 0, 0);
+        const base = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const before = s.effective.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height).data;
+        for (let p = 0; p < base.data.length; p += 4) if (before[p + 3]) {
+          // Canvas readback of a masked pixel may have rounding differences. Only
+          // copy RGB where matting actually corrected it, leaving other base RGB intact.
+          for (let c = 0; c < 3; c++) if (s.result.data[p + c] !== before[p + c]) base.data[p + c] = s.result.data[p + c];
+          base.data[p + 3] *= Math.min(1, s.result.data[p + 3] / before[p + 3]);
+        }
+        ctx.putImageData(base, 0, 0);
+        api.setBase(canvas);
+        clearTimeout(timer); s.processor.dispose();
+        session = createSession();
+        $("smartRisk").checked = false;
+        api.changed(); message("applied"); updateButtons(); api.layout();
+      } catch (_) { message("error"); }
+    }
+    function drawSeeds(ctx, rect) {
+      if (!session) return;
+      session.seeds.forEach((p, i) => {
+        const x = rect.x + (p.x + 0.5) * rect.w / session.base.width, y = rect.y + (p.y + 0.5) * rect.h / session.base.height;
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fillStyle = "#2878d9"; ctx.fill();
+        ctx.strokeStyle = "white"; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = "#142438"; ctx.font = "bold 12px sans-serif"; ctx.fillText(String(i + 1), x + 9, y - 8);
+      });
+    }
+    open.addEventListener("change", () => { if (open.checked) begin(); else cancel(); });
+    $("smartApply").addEventListener("click", apply);
+    $("smartAuto").addEventListener("click", () => { if (session) { inputs.mode.value = "outside"; session.seeds = []; session.auto = true; invalidate(); } });
+    $("smartInside").addEventListener("click", () => {
+      if (session) {
+        inputs.mode.value = "inside";
+        select({ x: Math.floor(session.base.width / 2), y: Math.floor(session.base.height / 2) }, false, false);
+      }
+    });
+    $("smartClear").addEventListener("click", () => { if (session) { session.seeds = []; session.auto = false; invalidate(); } });
+    $("smartRisk").addEventListener("change", updateButtons);
+    $("smartReset").addEventListener("click", resetEdits);
+    $("smartDefaults").addEventListener("click", restoreDefaults);
+    $("smartDownload").addEventListener("click", () => api.download(api.getEffective(), isToken ? "token.png" : "frame.png"));
+    for (const [key, input] of Object.entries(inputs)) input.addEventListener("input", () => {
+      const output = $("smart-" + key + "-value"); if (output) output.value = input.value;
+      if (key === "view") { if (session?.result) { makePreview(session); api.render(); } return; }
+      if (key === "mode" && session) { session.seeds = []; session.auto = false; }
+      invalidate(!["feather", "halo", "shadows"].includes(key));
+    });
+    document.addEventListener("keydown", event => { if (event.key === "Escape" && session) cancel(); });
+    setLanguage("ru"); updateButtons();
+    return { get active() { return Boolean(session); }, getPreview: () => session?.preview, select, drawSeeds, cancel, reset, setLanguage, tr };
+  }
+  root.SmartRemovalUI = { create };
+})(globalThis);
+
+/* ==================== EDITOR ==================== */
+// 4. Editor state, rendering, brushes, composition and export
 (() => {
   const LANG = {
     RU: "ru",
@@ -41,8 +975,18 @@
   const I18N = {
     ru: {
       title: "Image + Frame Mixer",
+      open: "Открыть файл",
+      filesGroup: "Загрузка изображения",
+      editsGroup: "Сброс и экспорт этой стороны",
+      tipResetBrushes: "Сбрасывает удаление цвета, локальную очистку и ластик только этой стороны. Умная очистка и другая сторона сохраняются.",
+      tipResetCenterMask: "Стирает только маску выступающих частей персонажа. Положение, масштаб и правки изображений сохраняются.",
+      tipBrushSize: "Диаметр основной кисти в пикселях исходного изображения. В локальном режиме ограничивает область удаления, в режиме ластика — ширину стирания.",
+      tipSampleSize: "Диаметр красной кисти, из которой берутся образцы цветов для локальной очистки. Удаление происходит только внутри основной фиолетовой кисти.",
+      tipMaskSize: "Диаметр кисти маски в пикселях итогового холста. ЛКМ показывает части персонажа поверх рамки, ПКМ убирает эту маску.",
+      tipOpenToken: "Открыть изображение токена с устройства.",
+      tipOpenFrame: "Открыть изображение рамки с устройства.",
       paste: "Вставить из буфера",
-      undo: "Откатить изменения",
+      undo: "Сбросить всю категорию",
       download: "Скачать",
       removeToken: "Кисть удаления на токене",
       removeFrame: "Кисть удаления на рамке",
@@ -82,7 +1026,7 @@
       tipPresets: "Открывает галерею готовых пресетов рамок для вставки в правое окно.",
       tipLangSelect: "Переключает язык интерфейса приложения.",
       tipPasteToken: "Вставляет изображение из буфера обмена в левое окно токена.",
-      tipUndoToken: "Сбрасывает все правки токена: удаление цвета и ластик.",
+      tipUndoToken: "Сбрасывает все правки токена: умную очистку, удаление цвета и ластик.",
       tipRemoveTokenCheck: "Включает инструменты очистки для токена и показ кистей.",
       tipTokenModeColor:
         "Удаляет выбранные цвета по всему токену; правая кнопка мыши отменяет действие и возвращает удаленные цвета.",
@@ -96,7 +1040,7 @@
       tipTokenScale: "Меняет масштаб токена в центральной композиции.",
       tipDownload: "Сохраняет текущий результат как PNG-файл.",
       tipPasteFrame: "Вставляет изображение из буфера обмена в правое окно рамки.",
-      tipUndoFrame: "Сбрасывает все правки рамки: удаление цвета и ластик.",
+      tipUndoFrame: "Сбрасывает все правки рамки: умную очистку, удаление цвета и ластик.",
       tipRemoveFrameCheck: "Включает инструменты очистки для рамки и показ кистей.",
       tipFrameModeColor:
         "Удаляет выбранные цвета по всей рамке; правая кнопка мыши отменяет действие и возвращает удаленные цвета.",
@@ -113,8 +1057,18 @@
     },
     en: {
       title: "Image + Frame Mixer",
+      open: "Open File",
+      filesGroup: "Load Image",
+      editsGroup: "Reset and Export This Side",
+      tipResetBrushes: "Resets color removal, local cleanup and eraser masks only on this side. Smart cleanup and the other side are preserved.",
+      tipResetCenterMask: "Clears only the character breakout mask. Placement, scale and image edits remain unchanged.",
+      tipBrushSize: "Main brush diameter in original-image pixels. In local mode it limits removal area; in eraser mode it sets stroke width.",
+      tipSampleSize: "Red brush diameter for sampling local cleanup colors. Removal is restricted to the main purple brush area.",
+      tipMaskSize: "Mask brush diameter in output-canvas pixels. Left click reveals the character above the frame; right click removes that mask.",
+      tipOpenToken: "Open a token image from your device.",
+      tipOpenFrame: "Open a frame image from your device.",
       paste: "Paste from Clipboard",
-      undo: "Undo Changes",
+      undo: "Reset Entire Category",
       download: "Download",
       removeToken: "Token Removal Brush",
       removeFrame: "Frame Removal Brush",
@@ -153,7 +1107,7 @@
       tipPresets: "Opens a gallery of ready-made frame presets to load into the right panel.",
       tipLangSelect: "Switches the application interface language.",
       tipPasteToken: "Pastes an image from clipboard into the left token panel.",
-      tipUndoToken: "Resets all token edits: color removal and eraser strokes.",
+      tipUndoToken: "Resets all token edits: smart removal, color removal and eraser strokes.",
       tipRemoveTokenCheck: "Enables token cleanup tools and brush overlays.",
       tipTokenModeColor:
         "Removes selected colors globally across the token image; right mouse button inverts the action and restores removed colors.",
@@ -167,7 +1121,7 @@
       tipTokenScale: "Changes token scale in the center composition.",
       tipDownload: "Saves the current result as a PNG file.",
       tipPasteFrame: "Pastes an image from clipboard into the right frame panel.",
-      tipUndoFrame: "Resets all frame edits: color removal and eraser strokes.",
+      tipUndoFrame: "Resets all frame edits: smart removal, color removal and eraser strokes.",
       tipRemoveFrameCheck: "Enables frame cleanup tools and brush overlays.",
       tipFrameModeColor:
         "Removes selected colors globally across the frame image; right mouse button inverts the action and restores removed colors.",
@@ -193,6 +1147,7 @@
     sides: {
       token: {
         source: null,
+        smartSource: null,
         masks: {
           color: null,
           local: null,
@@ -220,6 +1175,8 @@
       },
       frame: {
         source: null,
+        // Smart cleanup edits the frame base; source remains available for Reset.
+        smartSource: null,
         masks: {
           color: null,
           local: null,
@@ -247,6 +1204,7 @@
         assets: {
           overlay: null,
           windowMask: null,
+          hasWindow: false,
         },
       },
     },
@@ -273,12 +1231,33 @@
   };
 
   const ui = bindUI();
+  const smartRemovals = {};
   applyLanguage();
   const sideControllers = {
     token: createSideController(SIDE.TOKEN),
     frame: createSideController(SIDE.FRAME),
   };
   let layoutRenderScheduled = false;
+
+  Object.values(SIDE).forEach(sideName => {
+    const side = state.sides[sideName], sideUI = ui[sideName], controller = sideControllers[sideName];
+    smartRemovals[sideName] = SmartRemovalUI.create({
+      side: sideName,
+      getBase: () => side.smartSource || side.source,
+      getSmartBase: () => side.smartSource,
+      getEffective: () => composeEffectiveCanvas(side.source, side.masks.color, side.masks.local, side.masks.eraser),
+      setBase: canvas => { side.smartSource = canvas; },
+      setActive: active => sideUI.drop.classList.toggle("smart-active", active),
+      disableBrush: () => {
+        sideUI.removeCheck.checked = false;
+        sideUI.removeCheck.dispatchEvent(new Event("change"));
+      },
+      render: controller.renderPreview,
+      layout: requestLayoutRender,
+      changed: () => { controller.rebuildAssets(); controller.renderPreview(); renderCenterPreview(); },
+      download: downloadCanvas,
+    });
+  });
 
   setupAppEvents();
   setupPresets();
@@ -305,6 +1284,8 @@
         undoBtn: document.getElementById("undoTokenBtn"),
         modeInputs: document.querySelectorAll('input[name="tokenBrushMode"]'),
         pasteBtn: document.getElementById("pasteTokenBtn"),
+        openBtn: document.getElementById("openTokenBtn"),
+        fileInput: document.getElementById("openTokenFile"),
       },
       frame: {
         drop: frameDrop,
@@ -322,6 +1303,8 @@
         undoBtn: document.getElementById("undoFrameBtn"),
         modeInputs: document.querySelectorAll('input[name="frameBrushMode"]'),
         pasteBtn: document.getElementById("pasteFrameBtn"),
+        openBtn: document.getElementById("openFrameBtn"),
+        fileInput: document.getElementById("openFrameFile"),
       },
       center: {
         modeSelect: document.getElementById("modeSelect"),
@@ -383,6 +1366,7 @@
         setSource(drawableToCanvas(image));
       },
       onRemoveToggle: () => {
+        if (sideUI.removeCheck.checked) smartRemovals[sideName]?.cancel();
         sideState.enabled = sideUI.removeCheck.checked;
         sideUI.brushControls.classList.toggle("show", sideState.enabled);
         updateLocalSizeVisibility();
@@ -470,6 +1454,12 @@
 
         const point = toPoint(sideUI.drop, event.clientX, event.clientY);
         if (!pointInRect(sideState.viewport.displayRect, point.x, point.y)) {
+          return;
+        }
+
+        if (smartRemovals[sideName]?.active && event.button !== 1) {
+          smartRemovals[sideName].select(widgetToImagePoint(sideState.viewport.displayRect, sideState.source, point.x, point.y), event.button === 2, event.shiftKey);
+          event.preventDefault();
           return;
         }
 
@@ -584,6 +1574,12 @@
 
     function bindEvents() {
       setupDropArea(sideUI.drop, handlers.onDropFile);
+      sideUI.openBtn.addEventListener("click", () => sideUI.fileInput.click());
+      sideUI.fileInput.addEventListener("change", event => {
+        const file = event.target.files[0];
+        if (file) handlers.onDropFile(file);
+        event.target.value = "";
+      });
       sideUI.removeCheck.addEventListener("change", handlers.onRemoveToggle);
       sideUI.brushSizeInput.addEventListener("input", handlers.onBrushSizeChange);
       sideUI.localBrushSizeInput.addEventListener("input", handlers.onLocalBrushSizeChange);
@@ -596,6 +1592,7 @@
       sideUI.canvas.addEventListener("mouseleave", handlers.onMouseLeave);
       sideUI.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
       sideUI.undoBtn.addEventListener("click", handlers.onUndo);
+      document.getElementById(sideName === SIDE.FRAME ? "resetFrameBrushBtn" : "resetTokenBrushBtn").addEventListener("click", resetBrushMasks);
       sideUI.pasteBtn.addEventListener("click", handlers.onPaste);
       window.addEventListener("resize", renderPreview);
     }
@@ -617,16 +1614,27 @@
     }
 
     function resetMasks(shouldRender = true) {
+      smartRemovals[sideName]?.reset();
       sideState.masks.color = null;
       sideState.masks.local = null;
       sideState.masks.eraser = null;
       if (sideName === SIDE.FRAME) {
+        sideState.assets.hasWindow = false;
         rebuildDerivedAssets();
       }
       if (shouldRender) {
         renderPreview();
         renderCenterPreview();
       }
+    }
+
+    function resetBrushMasks() {
+      smartRemovals[sideName]?.cancel();
+      sideState.paint.active = false;
+      sideState.masks.color = null;
+      sideState.masks.local = null;
+      sideState.masks.eraser = null;
+      rebuildDerivedAssets(); renderPreview(); renderCenterPreview();
     }
 
     function rebuildDerivedAssets() {
@@ -637,11 +1645,14 @@
       if (!effective) {
         state.sides.frame.assets.overlay = null;
         state.sides.frame.assets.windowMask = null;
+        state.sides.frame.assets.hasWindow = false;
         return;
       }
-      const assets = buildFrameAssets(effective);
+      const previousWindow = sideState.assets.hasWindow ? sideState.assets.windowMask : null;
+      const assets = buildFrameAssets(effective, previousWindow);
       state.sides.frame.assets.overlay = assets.overlay;
       state.sides.frame.assets.windowMask = assets.windowMask;
+      state.sides.frame.assets.hasWindow = assets.hasWindow;
     }
 
     function renderPreview() {
@@ -654,7 +1665,7 @@
       }
       ctx.clearRect(0, 0, width, height);
 
-      const image = effectiveCanvas(sideName);
+      const image = smartRemovals[sideName]?.getPreview() || effectiveCanvas(sideName);
       if (!image) {
         sideUI.placeholder.style.display = "grid";
         sideState.viewport.displayRect = null;
@@ -671,6 +1682,7 @@
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
       ctx.drawImage(image, drawX, drawY, drawW, drawH);
+      smartRemovals[sideName]?.drawSeeds(ctx, { x: drawX, y: drawY, w: drawW, h: drawH });
 
       sideState.viewport.displayRect = { x: drawX, y: drawY, w: drawW, h: drawH };
       sideState.viewport.displayScale = drawW / image.width;
@@ -685,7 +1697,7 @@
 
       if (sideState.brushMode === BRUSH_MODES.COLOR) {
         applyGlobalColorMask(
-          sideState.source,
+          sideState.smartSource || sideState.source,
           sideState.masks.color,
           sideState.masks.local,
           sideState.masks.eraser,
@@ -698,7 +1710,7 @@
         );
       } else if (sideState.brushMode === BRUSH_MODES.LOCAL) {
         applyLocalColorMask(
-          sideState.source,
+          sideState.smartSource || sideState.source,
           sideState.masks.color,
           sideState.masks.local,
           sideState.masks.eraser,
@@ -776,6 +1788,11 @@
     app.langSelect.addEventListener("change", () => {
       state.language = app.langSelect.value === LANG.EN ? LANG.EN : LANG.RU;
       applyLanguage();
+    });
+
+    document.getElementById("resetCenterMaskBtn").addEventListener("click", () => {
+      state.center.userMask = null;
+      renderCenterPreview();
     });
 
     center.modeSelect.addEventListener("change", () => {
@@ -1331,6 +2348,9 @@
     if (!sourceCanvas) {
       return null;
     }
+    for (const side of Object.values(state.sides)) {
+      if (sourceCanvas === side.source) { sourceCanvas = side.smartSource || sourceCanvas; break; }
+    }
 
     const out = createCanvas(sourceCanvas.width, sourceCanvas.height);
     const ctx = out.getContext("2d");
@@ -1567,7 +2587,7 @@
     }
   }
 
-  function buildFrameAssets(frameCanvas) {
+  function buildFrameAssets(frameCanvas, previousWindow = null) {
     const src = createCanvas(frameCanvas.width, frameCanvas.height);
     const srcCtx = src.getContext("2d", { willReadFrequently: true });
     srcCtx.drawImage(frameCanvas, 0, 0);
@@ -1594,44 +2614,17 @@
     }
 
     const seed = findWindowSeed(passable, width, height);
-    const inner = new Uint8Array(width * height);
+    const inner = SmartBackgroundRemoval.findEnclosedRegion(passable, width, height, seed);
+    const hasWindow = inner.some(Boolean);
 
-    if (seed) {
-      const qx = new Int32Array(width * height);
-      const qy = new Int32Array(width * height);
-      let head = 0;
-      let tail = 0;
-      qx[tail] = seed.x;
-      qy[tail] = seed.y;
-      tail += 1;
-      inner[seed.y * width + seed.x] = 1;
-
-      while (head < tail) {
-        const px = qx[head];
-        const py = qy[head];
-        head += 1;
-
-        const neighbors = [
-          [px + 1, py],
-          [px - 1, py],
-          [px, py + 1],
-          [px, py - 1],
-        ];
-
-        for (const [nx, ny] of neighbors) {
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
-            continue;
-          }
-          const idx = ny * width + nx;
-          if (inner[idx] || !passable[idx]) {
-            continue;
-          }
-          inner[idx] = 1;
-          qx[tail] = nx;
-          qy[tail] = ny;
-          tail += 1;
-        }
-      }
+    // Erasing a piece of an already-open frame can connect its opening to the
+    // outside. Keep the last valid window rather than revealing the portrait
+    // outside the ring or making it disappear. A new source/reset clears this cache.
+    if (!hasWindow && previousWindow && previousWindow.width === width && previousWindow.height === height && passable[Math.floor(height / 2) * width + Math.floor(width / 2)]) {
+      const overlay = createCanvas(width, height), ctx = overlay.getContext("2d");
+      ctx.drawImage(src, 0, 0); ctx.globalCompositeOperation = "destination-out";
+      ctx.drawImage(previousWindow, 0, 0); ctx.globalCompositeOperation = "source-over";
+      return { overlay, windowMask: previousWindow, hasWindow: true };
     }
 
     const overlay = createCanvas(width, height);
@@ -1657,7 +2650,7 @@
     overlayCtx.putImageData(overlayImage, 0, 0);
     windowMaskCtx.putImageData(windowMaskImage, 0, 0);
 
-    return { overlay, windowMask };
+    return { overlay, windowMask, hasWindow };
   }
 
   function findWindowSeed(passable, width, height) {
@@ -1763,11 +2756,15 @@
   }
 
   function downloadComposedImage() {
-    if (!state.center.composed) {
+    downloadCanvas(state.center.composed, "mixed_image.png");
+  }
+
+  function downloadCanvas(canvas, filename) {
+    if (!canvas) {
       return;
     }
 
-    state.center.composed.toBlob((blob) => {
+    canvas.toBlob((blob) => {
       if (!blob) {
         alert(t("alertSaveFailed"));
         return;
@@ -1776,7 +2773,7 @@
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = "mixed_image.png";
+      anchor.download = filename;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -2396,26 +3393,31 @@
     const app = ui.app;
     app.title.textContent = t("title");
     app.langSelect.value = state.language;
-    app.pasteTokenBtn.textContent = t("paste");
-    app.undoTokenBtn.textContent = t("undo");
+    labelIconButton(ui.token.openBtn, t("open"), t("tipOpenToken"));
+    labelIconButton(app.pasteTokenBtn, t("paste"), t("tipPasteToken"));
+    labelIconButton(app.undoTokenBtn, t("undo"), t("tipUndoToken"));
     app.removeTokenLabel.textContent = t("removeToken");
     app.tokenModeColorLabel.textContent = t("modeColor");
     app.tokenModeLocalLabel.textContent = t("modeLocal");
     app.tokenModeEraserLabel.textContent = t("modeEraser");
     app.tokenDropPlaceholder.textContent = t("placeholderToken");
-    app.pasteFrameBtn.textContent = t("paste");
-    app.undoFrameBtn.textContent = t("undo");
+    labelIconButton(ui.frame.openBtn, t("open"), t("tipOpenFrame"));
+    labelIconButton(app.pasteFrameBtn, t("paste"), t("tipPasteFrame"));
+    labelIconButton(app.undoFrameBtn, t("undo"), t("tipUndoFrame"));
     app.removeFrameLabel.textContent = t("removeFrame");
     app.frameModeColorLabel.textContent = t("modeColor");
     app.frameModeLocalLabel.textContent = t("modeLocal");
     app.frameModeEraserLabel.textContent = t("modeEraser");
     app.frameDropPlaceholder.textContent = t("placeholderFrame");
     app.previewPlaceholder.textContent = t("placeholderPreview");
+    document.querySelectorAll(".panel-reset").forEach(button => { button.textContent = t("undo"); });
 
     ui.center.downloadBtn.textContent = t("download");
 
-    ui.presets.openBtn.textContent = t("presetsButton");
-    ui.presets.openBtn.title = t("tipPresets");
+    labelIconButton(ui.presets.openBtn, t("presetsButton"), t("tipPresets"));
+    document.querySelectorAll("[data-toolbar-label]").forEach(group => {
+      group.setAttribute("aria-label", t(group.dataset.toolbarLabel === "files" ? "filesGroup" : "editsGroup"));
+    });
     ui.presets.title.textContent = t("presetsTitle");
     ui.presets.disclaimer.textContent = t("presetsDisclaimer");
     ui.presets.closeBtn.setAttribute("aria-label", t("presetsClose"));
@@ -2439,6 +3441,7 @@
     updateSideBrushLabels(SIDE.TOKEN);
     updateSideBrushLabels(SIDE.FRAME);
     updateCenterBrushLabel();
+    Object.values(smartRemovals).forEach(controller => controller.setLanguage(state.language));
 
     // If the presets modal is open, re-render it so localized category names and
     // descriptions update immediately on a language switch.
@@ -2449,6 +3452,12 @@
         showCategoryList();
       }
     }
+  }
+
+  function labelIconButton(button, label, tooltip) {
+    button.setAttribute("aria-label", label);
+    button.title = tooltip;
+    button.dataset.tooltip = tooltip;
   }
 
   function updateTokenScaleOptionLabels() {
@@ -2524,5 +3533,16 @@
         input.closest("label").title = input.title;
       }
     });
+    for (const sideName of Object.values(SIDE)) {
+      const side = ui[sideName];
+      EditorTooltips.set(side.removeCheck, side.removeCheck.title, true);
+      EditorTooltips.set(side.brushSizeInput, t("tipBrushSize"), true);
+      EditorTooltips.set(side.localBrushSizeInput, t("tipSampleSize"), true);
+      side.modeInputs.forEach(input => EditorTooltips.set(input, input.title, true));
+      EditorTooltips.set(document.getElementById(sideName === SIDE.FRAME ? "resetFrameBrushBtn" : "resetTokenBrushBtn"), t("tipResetBrushes"));
+    }
+    for (const control of [app.langSelect, center.modeSelect, center.scaleSelect, center.tokenScaleSelect]) EditorTooltips.set(control, control.title);
+    EditorTooltips.set(center.brushSizeInput, t("tipMaskSize"), true);
+    EditorTooltips.set(document.getElementById("resetCenterMaskBtn"), t("tipResetCenterMask"));
   }
 })();

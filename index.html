@@ -7,6 +7,16 @@
   <link rel="stylesheet" href="./main.css" />
 </head>
 <body>
+  <svg class="icon-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-open" viewBox="0 0 24 24"><path d="M3 8V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2M3 8h18l-3 12H3z" /></symbol>
+    <symbol id="icon-paste" viewBox="0 0 24 24"><rect x="8" y="3" width="8" height="4" rx="1" /><path d="M8 5H5a2 2 0 0 0-2 2v13h14V7a2 2 0 0 0-1-2M7 11h6M7 15h6" /></symbol>
+    <symbol id="icon-presets" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3" /><circle cx="12" cy="12" r="5" /><path d="M12 5v2m0 10v2M5 12h2m10 0h2" /></symbol>
+    <symbol id="icon-reset" viewBox="0 0 24 24"><path d="M3 4v6h6M3 10a9 9 0 1 1 1 8" /></symbol>
+    <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5" /></symbol>
+    <symbol id="icon-outside" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" /><path d="M8 3H3v5m0-5 4 4m9-4h5v5m0-5-4 4M3 16v5h5m-5 0 4-4m14-1v5h-5m5 0-4-4" /></symbol>
+    <symbol id="icon-inside" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="2" /><path d="M12 2v3m0 14v3M2 12h3m14 0h3" /></symbol>
+    <symbol id="icon-clear-points" viewBox="0 0 24 24"><circle cx="6" cy="7" r="2" /><circle cx="14" cy="5" r="2" /><circle cx="5" cy="16" r="2" /><path d="m13 13 7 7m0-7-7 7" /></symbol>
+  </svg>
   <div class="lang-switch">
     <select id="langSelect" aria-label="Language">
       <option value="ru" selected>RU</option>
@@ -17,9 +27,16 @@
 
   <main class="app">
     <section class="column">
-      <div class="btn-row">
-        <button id="pasteTokenBtn" class="btn" type="button">Вставить из буфера</button>
-        <button id="undoTokenBtn" class="btn" type="button">Откатить изменения</button>
+      <div class="side-toolbar">
+        <div class="icon-group" role="group" data-toolbar-label="files">
+          <button id="openTokenBtn" class="btn icon-btn" type="button" aria-label="Открыть файл" title="Открыть файл" data-tooltip="Открыть файл"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-open"></use></svg></button>
+          <input id="openTokenFile" type="file" accept="image/*" hidden />
+          <button id="pasteTokenBtn" class="btn icon-btn" type="button" aria-label="Вставить из буфера" title="Вставить из буфера" data-tooltip="Вставить из буфера"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-paste"></use></svg></button>
+        </div>
+        <div class="icon-group" role="group" data-toolbar-label="edits">
+          <button id="undoTokenBtn" class="btn icon-btn" type="button" aria-label="Сбросить всю категорию" title="Сбросить всю категорию" data-tooltip="Сбросить всю категорию"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-reset"></use></svg></button>
+          <button id="tokenSmartDownload" class="btn icon-btn" type="button" disabled aria-label="PNG изображения" title="PNG изображения"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-download"></use></svg></button>
+        </div>
       </div>
       <label class="frame-tools">
         <input id="removeTokenColorCheck" type="checkbox" />
@@ -39,8 +56,10 @@
           <span id="tokenLocalBrushLabel">Красная кисть: 15</span>
           <input id="tokenLocalBrushSize" type="range" min="3" max="120" value="15" />
         </div>
+        <button id="resetTokenBrushBtn" class="btn panel-reset" type="button">Сбросить всю категорию</button>
       </div>
-      <div id="tokenDrop" class="drop-area">
+      <div class="smart-tools" data-smart-side="token"></div>
+      <div id="tokenDrop" class="drop-area image-checker">
         <canvas id="tokenCanvas" class="token-canvas"></canvas>
         <div id="tokenCursorOverlay" class="cursor-overlay"></div>
         <div id="tokenSampleCursorOverlay" class="cursor-overlay"></div>
@@ -95,6 +114,7 @@
       <div id="brushControls" class="brush-controls">
         <span id="brushLabel">Кисть: 30</span>
         <input id="brushSize" type="range" min="5" max="120" value="30" />
+        <button id="resetCenterMaskBtn" class="btn panel-reset" type="button">Сбросить всю категорию</button>
       </div>
 
       <div id="previewWrap" class="preview-wrap">
@@ -109,10 +129,17 @@
     </section>
 
     <section class="column">
-      <div class="btn-row btn-row--frame">
-        <button id="pasteFrameBtn" class="btn" type="button">Вставить из буфера</button>
-        <button id="undoFrameBtn" class="btn" type="button">Откатить изменения</button>
-        <button id="framePresetsBtn" class="btn btn-presets" type="button">Пресеты</button>
+      <div class="side-toolbar">
+        <div class="icon-group" role="group" data-toolbar-label="files">
+          <button id="openFrameBtn" class="btn icon-btn" type="button" aria-label="Открыть файл" title="Открыть файл" data-tooltip="Открыть файл"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-open"></use></svg></button>
+          <input id="openFrameFile" type="file" accept="image/*" hidden />
+          <button id="pasteFrameBtn" class="btn icon-btn" type="button" aria-label="Вставить из буфера" title="Вставить из буфера" data-tooltip="Вставить из буфера"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-paste"></use></svg></button>
+          <button id="framePresetsBtn" class="btn icon-btn btn-presets" type="button" aria-label="Пресеты" title="Пресеты" data-tooltip="Пресеты"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-presets"></use></svg></button>
+        </div>
+        <div class="icon-group" role="group" data-toolbar-label="edits">
+          <button id="undoFrameBtn" class="btn icon-btn" type="button" aria-label="Сбросить всю категорию" title="Сбросить всю категорию" data-tooltip="Сбросить всю категорию"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-reset"></use></svg></button>
+          <button id="smartDownload" class="btn icon-btn" type="button" disabled aria-label="PNG рамки" title="PNG рамки"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-download"></use></svg></button>
+        </div>
       </div>
       <label class="frame-tools">
         <input id="removeFrameColorCheck" type="checkbox" />
@@ -132,8 +159,10 @@
           <span id="frameLocalBrushLabel">Красная кисть: 15</span>
           <input id="frameLocalBrushSize" type="range" min="3" max="120" value="15" />
         </div>
+        <button id="resetFrameBrushBtn" class="btn panel-reset" type="button">Сбросить всю категорию</button>
       </div>
-      <div id="frameDrop" class="drop-area">
+      <div class="smart-tools" data-smart-side="frame"></div>
+      <div id="frameDrop" class="drop-area image-checker">
         <canvas id="frameCanvas" class="frame-canvas"></canvas>
         <div id="frameCursorOverlay" class="cursor-overlay"></div>
         <div id="frameSampleCursorOverlay" class="cursor-overlay"></div>
@@ -157,6 +186,50 @@
       <div id="presetsGrid" class="presets-grid"></div>
     </div>
   </div>
+
+  <template id="smartRemovalTemplate">
+    <label class="frame-tools smart-switch">
+      <input id="smartOpen" type="checkbox" aria-controls="smartPanel" aria-expanded="false" disabled />
+      <span data-smart-text="title">Умное удаление фона</span>
+    </label>
+    <div id="smartPanel" class="smart-panel" hidden>
+      <p class="smart-hint" data-smart-text="hint"></p>
+      <div class="smart-selects">
+        <label><span data-smart-text="structureLabel"></span>
+          <select id="smart-structure"><option value="auto" data-smart-text="structureAuto"></option><option value="color" data-smart-text="structureColor"></option><option value="ring" data-smart-text="structureRing" data-smart-frame-only></option></select>
+        </label>
+        <label><span data-smart-text="mode"></span>
+          <select id="smart-mode"><option value="inside" data-smart-text="inside"></option><option value="outside" data-smart-text="outside"></option></select>
+        </label>
+      </div>
+      <div id="smartSeedTools" class="icon-group smart-seed-tools" role="group">
+        <button id="smartAuto" class="btn icon-btn" type="button" data-smart-label="auto"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-outside"></use></svg></button>
+        <button id="smartInside" class="btn icon-btn" type="button" data-smart-label="findInside"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-inside"></use></svg></button>
+        <button id="smartClear" class="btn icon-btn" type="button" data-smart-label="clear"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-clear-points"></use></svg></button>
+      </div>
+      <label class="smart-range"><span data-smart-text="color"></span><output id="smart-color-value" for="smart-color">28</output><input id="smart-color" type="range" min="0" max="100" value="28" /></label>
+      <details id="smartAdvanced">
+        <summary data-smart-text="advanced"></summary>
+        <div class="smart-advanced">
+          <label class="smart-range"><span data-smart-text="edge"></span><output id="smart-edge-value" for="smart-edge">65</output><input id="smart-edge" type="range" min="0" max="100" value="65" /></label>
+          <label class="smart-range"><span data-smart-text="feather"></span><output id="smart-feather-value" for="smart-feather">1</output><input id="smart-feather" type="range" min="0" max="5" value="1" /></label>
+          <label class="smart-range"><span data-smart-text="local"></span><output id="smart-local-value" for="smart-local">24</output><input id="smart-local" type="range" min="0" max="100" value="24" /></label>
+          <label class="smart-range"><span data-smart-text="closing"></span><output id="smart-closing-value" for="smart-closing">1</output><input id="smart-closing" type="range" min="0" max="3" value="1" /></label>
+          <label class="smart-check"><input id="smart-halo" type="checkbox" checked /><span data-smart-text="halo"></span></label>
+          <label class="smart-check"><input id="smart-shadows" type="checkbox" /><span data-smart-text="shadows"></span></label>
+          <label class="smart-check" data-smart-frame-only><input id="smart-radial" type="checkbox" /><span data-smart-text="radialLabel"></span></label>
+          <button id="smartDefaults" class="btn smart-defaults" type="button" data-smart-text="defaults"></button>
+        </div>
+      </details>
+      <label><span data-smart-text="view"></span><select id="smart-view"><option value="highlight" data-smart-text="highlight"></option><option value="transparency" data-smart-text="transparency"></option></select></label>
+      <p id="smartStatus" class="smart-status" role="status" aria-live="polite"></p>
+      <label id="smartRiskRow" class="smart-check smart-warning" hidden><input id="smartRisk" type="checkbox" /><span data-smart-text="acknowledge"></span></label>
+      <div class="btn-row">
+        <button id="smartApply" class="btn btn-presets" type="button" data-smart-text="apply" disabled></button>
+        <button id="smartReset" class="btn panel-reset" type="button" data-smart-text="reset"></button>
+      </div>
+    </div>
+  </template>
 
   <script src="./main.js" defer></script>
 </body>
